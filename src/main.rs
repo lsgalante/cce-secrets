@@ -224,9 +224,19 @@ struct SecretsApp {
 }
 
 impl SecretsApp {
+    /// The search box's live content: `edit_buffer` while editing (`text`
+    /// only syncs on commit — TextBox landmine).
+    fn query_text(&self) -> &str {
+        if self.search_box.editing {
+            &self.search_box.edit_buffer
+        } else {
+            &self.search_box.text
+        }
+    }
+
     /// Indices into `entries` matching the search box, in display order.
     fn filtered(&self) -> Vec<usize> {
-        let query = self.search_box.text.to_lowercase();
+        let query = self.query_text().to_lowercase();
         (0..self.entries.len())
             .filter(|&i| {
                 if query.is_empty() {
@@ -611,6 +621,7 @@ impl Application for SecretsApp {
             if let Key::Named(NamedKey::Escape) = event.logical_key {
                 if self.search_box.focused(&self.ui_context) {
                     self.search_box.text.clear();
+                    self.search_box.edit_buffer.clear();
                     self.search_box.unfocus();
                     self.scroll_y = 0.0;
                     *needs_rebuild = true;
