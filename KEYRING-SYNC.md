@@ -11,8 +11,11 @@ deletion → kdbx Recycle Bin (verified in keepassxc-cli's own listing), new
 entries both directions, adoption of a keyring-born entry with UUID stamping,
 conflicted-copy refusal, and doctor merging a staged conflict whose entry then
 synced through. Files written by the `keepass` crate re-open in keepassxc-cli,
-and pre-KDBX4 databases are upgraded loudly on first write. Phase 3 (a Sync
-action in the cce-secrets UI) remains.
+and pre-KDBX4 databases are upgraded loudly on first write. Phase 3 shipped: a Sync button in
+cce-secrets (runs the same binary the timer runs, so the flock serializes a
+click against a timer tick; its summary or refusal text lands in the status
+line, and the list reloads after), plus a right-aligned "synced Nm ago" hint
+read from the sync state file.
 
 ## Goal
 

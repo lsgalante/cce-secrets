@@ -57,6 +57,10 @@ enum Purpose {
 
 enum Cmd {
     Reload,
+    /// Run one `cce-keyring-sync sync` pass and reload. The sync logic stays
+    /// in the one binary the timer also runs; the UI only invokes it, so the
+    /// flock naturally serializes a button press against a timer tick.
+    Sync,
     GetSecret { path: String, purpose: Purpose },
     CreateItem { label: String, attrs: Vec<(String, String)>, secret: String },
     UpdateItem { path: String, label: String, attrs: Vec<(String, String)>, secret: Option<String> },
@@ -70,6 +74,7 @@ enum AppMessage {
     Revealed { path: String, secret: String },
     SelectPath(String),
     RefreshClicked,
+    SyncClicked,
     RevealClicked,
     CopyClicked,
     NewClicked,
@@ -84,6 +89,41 @@ enum AppMessage {
 enum Mode {
     Browse,
     Edit { path: Option<String> },
+}
+
+/// One pass of the external sync tool. Success reports its own summary line
+/// ("synced: … " or "in sync"); refusals — conflicted copies, Dropbox
+/// settling, the flock — arrive as the error text, which is exactly the
+/// guidance the user needs ("run doctor").
+async fn run_sync(tx: &calloop::channel::Sender<AppMessage>) {
+    let out = tokio::process::Command::new("cce-keyring-sync")
+        .arg("sync")
+        .output()
+        .await;
+    match out {
+        Ok(out) => {
+            let pick = |bytes: &[u8]| {
+                String::from_utf8_lossy(bytes)
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if out.status.success() {
+                let line = pick(&out.stdout);
+                let msg = if line.is_empty() { "synced".to_string() } else { line };
+                let _ = tx.send(AppMessage::Status(msg, false));
+            } else {
+                let line = pick(&out.stderr);
+                let msg = if line.is_empty() { "sync failed".to_string() } else { line };
+                let _ = tx.send(AppMessage::Status(msg, true));
+            }
+        }
+        Err(e) => {
+            let _ = tx.send(AppMessage::Status(format!("cce-keyring-sync not runnable: {e}"), true));
+        }
+    }
 }
 
 // ── Secret Service worker ─────────────────────────────────────────────────
@@ -117,6 +157,10 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
             while let Ok(cmd) = rx.recv() {
                 match cmd {
                     Cmd::Reload => load_entries(&ss, &tx).await,
+                    Cmd::Sync => {
+                        run_sync(&tx).await;
+                        load_entries(&ss, &tx).await;
+                    }
                     Cmd::GetSecret { path, purpose } => fetch_secret(&ss, &tx, path, purpose).await,
                     Cmd::CreateItem { label, attrs, secret } => {
                         create_item(&ss, &tx, label, attrs, secret).await
@@ -330,6 +374,7 @@ async fn delete_item(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppMe
 struct SecretsApp {
     search_box: cce_ui::widget::Adapted<TextBox>,
     refresh_btn: cce_ui::widget::Adapted<Button>,
+    sync_btn: cce_ui::widget::Adapted<Button>,
     new_btn: cce_ui::widget::Adapted<Button>,
     reveal_btn: cce_ui::widget::Adapted<Button>,
     copy_btn: cce_ui::widget::Adapted<Button>,
@@ -361,6 +406,10 @@ struct SecretsApp {
 
     status_msg: String,
     status_is_error: bool,
+    /// Right side of the status line: "synced 4m ago", off the sync tool's
+    /// state file. Cached — the file is only re-read every few seconds.
+    sync_hint: String,
+    sync_hint_at: Option<std::time::Instant>,
 
     cmd_tx: std::sync::mpsc::Sender<Cmd>,
     cmd_rx: Option<std::sync::mpsc::Receiver<Cmd>>,
@@ -491,9 +540,46 @@ impl SecretsApp {
         })
     }
 
-    fn buttons_mut(&mut self) -> [&mut cce_ui::widget::Adapted<Button>; 8] {
+    /// "synced 4m ago" from cce-keyring-sync's state file, refreshed at most
+    /// every 5s — the timer runs every 15 minutes, so staleness is invisible.
+    fn refresh_sync_hint(&mut self) {
+        if self.sync_hint_at.is_some_and(|t| t.elapsed().as_secs() < 5) {
+            return;
+        }
+        self.sync_hint_at = Some(std::time::Instant::now());
+        let path = std::env::var("XDG_STATE_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+            })
+            .join("cce/keyring-sync/state.json");
+        self.sync_hint = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("last_run").and_then(|n| n.as_i64()))
+            .filter(|&t| t > 0)
+            .map(|t| {
+                let ago = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+                    - t)
+                    .max(0);
+                match ago {
+                    0..=90 => "synced just now".to_string(),
+                    91..=5400 => format!("synced {}m ago", ago / 60),
+                    _ => format!("synced {}h ago", ago / 3600),
+                }
+            })
+            .unwrap_or_default();
+    }
+
+    fn buttons_mut(&mut self) -> [&mut cce_ui::widget::Adapted<Button>; 9] {
         [
             &mut self.refresh_btn,
+            &mut self.sync_btn,
             &mut self.new_btn,
             &mut self.reveal_btn,
             &mut self.copy_btn,
@@ -508,6 +594,7 @@ impl SecretsApp {
         vec![
             &self.search_box,
             &self.refresh_btn,
+            &self.sync_btn,
             &self.new_btn,
             &self.reveal_btn,
             &self.copy_btn,
@@ -549,6 +636,7 @@ impl Application for SecretsApp {
         Self {
             search_box: TextBox::new(String::new()).with_placeholder("Search"),
             refresh_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Refresh"),
+            sync_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Sync"),
             new_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("New"),
             reveal_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Reveal"),
             copy_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Copy"),
@@ -572,6 +660,8 @@ impl Application for SecretsApp {
             hover_row: None,
             status_msg: "Connecting to Secret Service…".to_string(),
             status_is_error: false,
+            sync_hint: String::new(),
+            sync_hint_at: None,
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             sender,
@@ -630,6 +720,11 @@ impl Application for SecretsApp {
             }
             AppMessage::RefreshClicked => {
                 let _ = self.cmd_tx.send(Cmd::Reload);
+            }
+            AppMessage::SyncClicked => {
+                self.status_msg = "Syncing…".to_string();
+                self.status_is_error = false;
+                let _ = self.cmd_tx.send(Cmd::Sync);
             }
             AppMessage::RevealClicked => {
                 if let Some(sel) = self.selected.clone() {
@@ -690,6 +785,10 @@ impl Application for SecretsApp {
         {
             let (id, ptr) = (self.search_box.id(), self.search_box.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
+            {
+                let (id, ptr) = (self.sync_btn.id(), self.sync_btn.as_ptr_mut());
+                self.ui_context.register_widget(id, ptr);
+            }
             let (id, ptr) = (self.refresh_btn.id(), self.refresh_btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
             let (id, ptr) = (self.new_btn.id(), self.new_btn.as_ptr_mut());
@@ -729,6 +828,7 @@ impl Application for SecretsApp {
         self.search_box.set_rect(PAD, PAD, LIST_W, 30.0);
         self.refresh_btn.set_rect(sw - PAD - BTN_W, PAD, BTN_W, BTN_H);
         self.new_btn.set_rect(sw - PAD - BTN_W * 2.0 - 10.0, PAD, BTN_W, BTN_H);
+        self.sync_btn.set_rect(sw - PAD - BTN_W * 3.0 - 20.0, PAD, BTN_W, BTN_H);
 
         let list_y = PAD + 38.0;
         let list_h = (sh - list_y - STATUS_H - 8.0).max(0.0);
@@ -871,6 +971,19 @@ impl Application for SecretsApp {
             None,
             Some([PAD, sh - STATUS_H, sw - PAD, sh]),
         );
+        self.refresh_sync_hint();
+        if !self.sync_hint.is_empty() {
+            let w = cce_ui::widget::display::measure_text_width(&self.sync_hint, &cce_ui::layout::read_preferred_fonts().0, 10.0);
+            pc.text_with(
+                self.sync_hint.clone(),
+                sw - PAD - w,
+                sh - STATUS_H + 6.0,
+                10.0,
+                srgb_u8(cce_ui::colors::TEXT_DIM),
+                None,
+                Some([PAD, sh - STATUS_H, sw - PAD, sh]),
+            );
+        }
 
         Some(pc.finish())
     }
@@ -919,6 +1032,9 @@ impl Application for SecretsApp {
         }
         if self.refresh_btn.take_click() {
             return Some(AppMessage::RefreshClicked);
+        }
+        if self.sync_btn.take_click() {
+            return Some(AppMessage::SyncClicked);
         }
         if self.new_btn.take_click() {
             return Some(AppMessage::NewClicked);
