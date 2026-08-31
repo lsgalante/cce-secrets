@@ -1,0 +1,11 @@
+# Runs one bidirectional pass of cce-keyring-sync (see KEYRING-SYNC.md).
+# Driven by cce-keyring-sync.timer; harmless to start by hand.
+[Unit]
+Description=Sync gnome-keyring with the Dropbox kdbx
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cce-keyring-sync sync
+# Refusals (conflicted copies, Dropbox settling, another run holding the
+# lock) exit nonzero on purpose; the timer just tries again next tick.
+SuccessExitStatus=0 1

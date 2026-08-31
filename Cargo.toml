@@ -19,3 +19,4 @@ serde_json = "1"
 blake3 = "1"
 rpassword = "7"
 getrandom = "0.2"
+rustix = { version = "0.38", features = ["fs"] }

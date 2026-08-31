@@ -4,8 +4,15 @@ Status: **phase 1 shipped** (2026-08-31) — `cce-keyring-sync import` with
 `--dry-run`, `status`, the state file, quiescence + conflicted-copy detection.
 Verified end to end in an isolated `dbus-run-session` keyring against a fixture
 kdbx: create, idempotent re-run, update, secret round-trip, and a state file
-holding only keyed hashes. Phases 2–3 (bidirectional sync, `doctor`, timer, UI)
-remain scoping.
+holding only keyed hashes. Phase 2 shipped the same day: `sync`
+(the full three-way merge), `doctor`, and the 15-minute timer units. The whole
+merge table was exercised in an isolated keyring — kdbx→keyring edit, keyring
+deletion → kdbx Recycle Bin (verified in keepassxc-cli's own listing), new
+entries both directions, adoption of a keyring-born entry with UUID stamping,
+conflicted-copy refusal, and doctor merging a staged conflict whose entry then
+synced through. Files written by the `keepass` crate re-open in keepassxc-cli,
+and pre-KDBX4 databases are upgraded loudly on first write. Phase 3 (a Sync
+action in the cce-secrets UI) remains.
 
 ## Goal
 
