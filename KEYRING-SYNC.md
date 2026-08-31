@@ -1,6 +1,11 @@
 # Scoping: cce-keyring-sync — passwords synced across machines, cce-native UI here
 
-Status: **scoping only.** Nothing is implemented. Written 2026-08-31.
+Status: **phase 1 shipped** (2026-08-31) — `cce-keyring-sync import` with
+`--dry-run`, `status`, the state file, quiescence + conflicted-copy detection.
+Verified end to end in an isolated `dbus-run-session` keyring against a fixture
+kdbx: create, idempotent re-run, update, secret round-trip, and a state file
+holding only keyed hashes. Phases 2–3 (bidirectional sync, `doctor`, timer, UI)
+remain scoping.
 
 ## Goal
 

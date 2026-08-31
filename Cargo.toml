@@ -12,3 +12,10 @@ secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 zbus = "5"
 log = "0.4"
 env_logger = "0.11"
+# cce-keyring-sync only:
+keepass = { version = "0.13", features = ["save_kdbx4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+rpassword = "7"
+getrandom = "0.2"
