@@ -3,8 +3,8 @@ use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
-    Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, TextBox,
-    WidgetHost,
+    Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey,
+    ScrollMotion, TextBox, WidgetHost, LINE_PX,
 };
 
 const PAD: f32 = 16.0;
@@ -398,7 +398,11 @@ struct SecretsApp {
     /// Path armed for deletion by the first Delete click.
     pending_delete: Option<String>,
 
+    /// The DRAWN list offset — `scroll_motion` glides it (wheel) or coasts
+    /// it (trackpad flick); direct writes (Escape reset, clamp) are adopted
+    /// by the motion on its next step.
     scroll_y: f32,
+    scroll_motion: ScrollMotion,
     /// List viewport (x, y, w, h), refreshed each paint for hit-testing.
     list_rect: (f32, f32, f32, f32),
     pointer: (f32, f32),
@@ -456,6 +460,21 @@ impl SecretsApp {
 
     fn max_scroll(&self) -> f32 {
         (self.filtered().len() as f32 * ROW_H - self.list_rect.3).max(0.0)
+    }
+
+    /// Advance the wheel glide / flick coast; true while the offset is moving
+    /// (the frame loop keeps drawing). Hover follows the rows under the pointer.
+    fn tick_scroll(&mut self, dt: f32) -> bool {
+        self.scroll_motion.reconcile(0.0, self.scroll_y);
+        if !self.scroll_motion.is_animating() {
+            return false;
+        }
+        let moved = self.scroll_motion.tick(dt, Bounds::max(0.0), Bounds::max(self.max_scroll()));
+        self.scroll_y = self.scroll_motion.y.pos();
+        if moved {
+            self.hover_row = self.row_at(self.pointer.0, self.pointer.1);
+        }
+        moved || self.scroll_motion.is_animating()
     }
 
     fn row_at(&self, px: f32, py: f32) -> Option<usize> {
@@ -655,6 +674,7 @@ impl Application for SecretsApp {
             revealed: None,
             pending_delete: None,
             scroll_y: 0.0,
+            scroll_motion: ScrollMotion::new(),
             list_rect: (PAD, PAD + 38.0, LIST_W, 0.0),
             pointer: (0.0, 0.0),
             hover_row: None,
@@ -772,7 +792,11 @@ impl Application for SecretsApp {
         }
     }
 
-    fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
+    fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        if self.tick_scroll(dt) {
+            *needs_rebuild = true;
+        }
+    }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
         use cce_ui::scene::layout::Rect;
@@ -1112,13 +1136,10 @@ impl Application for SecretsApp {
         if pos.x < lx || pos.x > lx + lw || pos.y < ly || pos.y > ly + lh {
             return;
         }
-        let dy = match delta {
-            MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-            MouseScrollDelta::PixelDelta(p) => -p.y as f32,
-        };
-        let old = self.scroll_y;
-        self.scroll_y = (self.scroll_y + dy).clamp(0.0, self.max_scroll());
-        if (self.scroll_y - old).abs() > 0.01 {
+        self.scroll_motion.reconcile(0.0, self.scroll_y);
+        let moved = self.scroll_motion.apply(delta, (LINE_PX, LINE_PX), Bounds::max(0.0), Bounds::max(self.max_scroll()));
+        self.scroll_y = self.scroll_motion.y.pos();
+        if moved {
             self.hover_row = self.row_at(self.pointer.0, self.pointer.1);
             *needs_rebuild = true;
         }
