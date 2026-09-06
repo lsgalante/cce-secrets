@@ -55,6 +55,7 @@ enum Purpose {
     Reveal,
 }
 
+#[derive(Clone)]
 enum Cmd {
     Reload,
     /// Run one `cce-keyring-sync sync` pass and reload. The sync logic stays
@@ -143,7 +144,7 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
             }
         };
         rt.block_on(async move {
-            let ss = match SecretService::connect(EncryptionType::Dh).await {
+            let mut ss = match SecretService::connect(EncryptionType::Dh).await {
                 Ok(ss) => ss,
                 Err(e) => {
                     let _ = tx.send(AppMessage::Status(
@@ -161,18 +162,57 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
                         run_sync(&tx).await;
                         load_entries(&ss, &tx).await;
                     }
-                    Cmd::GetSecret { path, purpose } => fetch_secret(&ss, &tx, path, purpose).await,
-                    Cmd::CreateItem { label, attrs, secret } => {
-                        create_item(&ss, &tx, label, attrs, secret).await
+                    op => {
+                        let Err(first) = run_secret_op(&ss, &tx, op.clone()).await else {
+                            continue;
+                        };
+                        // The daemon may have restarted underneath us
+                        // (gnome-keyring aborted on a GLib assertion and was
+                        // relaunched, 2026-09-06). Listing survives that, but
+                        // the session negotiated at connect died with the old
+                        // process, and every secret transfer names it — so the
+                        // list looks fine while Copy/Reveal/Save fail. Take a
+                        // fresh connection (new session) and try exactly once
+                        // more; a failure on the retry is a real one.
+                        log::info!("secret op failed ({first}); reconnecting to the Secret Service and retrying once");
+                        match SecretService::connect(EncryptionType::Dh).await {
+                            Ok(fresh) => {
+                                ss = fresh;
+                                if let Err(second) = run_secret_op(&ss, &tx, op).await {
+                                    let _ = tx.send(AppMessage::Status(second, true));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppMessage::Status(
+                                    format!("{first} (reconnect to Secret Service failed: {e})"),
+                                    true,
+                                ));
+                            }
+                        }
                     }
-                    Cmd::UpdateItem { path, label, attrs, secret } => {
-                        update_item(&ss, &tx, path, label, attrs, secret).await
-                    }
-                    Cmd::DeleteItem { path } => delete_item(&ss, &tx, path).await,
                 }
             }
         });
     });
+}
+
+/// The session-bound commands: anything that transfers a secret (or edits
+/// an item) through the session opened at connect. `Err` is the status line
+/// to show; the caller decides whether to retry on a fresh connection first.
+async fn run_secret_op(
+    ss: &SecretService<'_>,
+    tx: &calloop::channel::Sender<AppMessage>,
+    cmd: Cmd,
+) -> Result<(), String> {
+    match cmd {
+        Cmd::Reload | Cmd::Sync => Ok(()),
+        Cmd::GetSecret { path, purpose } => fetch_secret(ss, tx, path, purpose).await,
+        Cmd::CreateItem { label, attrs, secret } => create_item(ss, tx, label, attrs, secret).await,
+        Cmd::UpdateItem { path, label, attrs, secret } => {
+            update_item(ss, tx, path, label, attrs, secret).await
+        }
+        Cmd::DeleteItem { path } => delete_item(ss, tx, path).await,
+    }
 }
 
 async fn load_entries(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppMessage>) {
@@ -236,19 +276,13 @@ async fn fetch_secret(
     tx: &calloop::channel::Sender<AppMessage>,
     path: String,
     purpose: Purpose,
-) {
-    let status_err = |msg: String| {
-        let _ = tx.send(AppMessage::Status(msg, true));
-    };
-    let item = match resolve_item(ss, &path).await {
-        Ok(i) => i,
-        Err(e) => return status_err(e),
-    };
+) -> Result<(), String> {
+    let item = resolve_item(ss, &path).await?;
     let _ = item.ensure_unlocked().await;
-    let bytes = match item.get_secret().await {
-        Ok(b) => b,
-        Err(e) => return status_err(format!("Secret fetch failed: {e}")),
-    };
+    let bytes = item
+        .get_secret()
+        .await
+        .map_err(|e| format!("Secret fetch failed: {e}"))?;
     let secret = String::from_utf8_lossy(&bytes).to_string();
     match purpose {
         Purpose::Copy => {
@@ -269,6 +303,7 @@ async fn fetch_secret(
             let _ = tx.send(AppMessage::Revealed { path, secret });
         }
     }
+    Ok(())
 }
 
 async fn resolve_item<'a>(
@@ -288,30 +323,22 @@ async fn create_item(
     label: String,
     attrs: Vec<(String, String)>,
     secret: String,
-) {
-    let collection = match ss.get_default_collection().await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(AppMessage::Status(format!("No default collection: {e}"), true));
-            return;
-        }
-    };
+) -> Result<(), String> {
+    let collection = ss
+        .get_default_collection()
+        .await
+        .map_err(|e| format!("No default collection: {e}"))?;
     let _ = collection.ensure_unlocked().await;
     let attr_map = attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    match collection
+    let item = collection
         .create_item(&label, attr_map, secret.as_bytes(), false, "text/plain")
         .await
-    {
-        Ok(item) => {
-            let new_path = item.item_path.to_string();
-            let _ = tx.send(AppMessage::Status(format!("Created \"{label}\""), false));
-            load_entries(ss, tx).await;
-            let _ = tx.send(AppMessage::SelectPath(new_path));
-        }
-        Err(e) => {
-            let _ = tx.send(AppMessage::Status(format!("Create failed: {e}"), true));
-        }
-    }
+        .map_err(|e| format!("Create failed: {e}"))?;
+    let new_path = item.item_path.to_string();
+    let _ = tx.send(AppMessage::Status(format!("Created \"{label}\""), false));
+    load_entries(ss, tx).await;
+    let _ = tx.send(AppMessage::SelectPath(new_path));
+    Ok(())
 }
 
 async fn update_item(
@@ -321,52 +348,37 @@ async fn update_item(
     label: String,
     attrs: Vec<(String, String)>,
     secret: Option<String>,
-) {
-    let item = match resolve_item(ss, &path).await {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = tx.send(AppMessage::Status(e, true));
-            return;
-        }
-    };
+) -> Result<(), String> {
+    let item = resolve_item(ss, &path).await?;
     let _ = item.ensure_unlocked().await;
-    if let Err(e) = item.set_label(&label).await {
-        let _ = tx.send(AppMessage::Status(format!("Saving label failed: {e}"), true));
-        return;
-    }
+    item.set_label(&label)
+        .await
+        .map_err(|e| format!("Saving label failed: {e}"))?;
     let attr_map = attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    if let Err(e) = item.set_attributes(attr_map).await {
-        let _ = tx.send(AppMessage::Status(format!("Saving attributes failed: {e}"), true));
-        return;
-    }
+    item.set_attributes(attr_map)
+        .await
+        .map_err(|e| format!("Saving attributes failed: {e}"))?;
     if let Some(secret) = secret {
-        if let Err(e) = item.set_secret(secret.as_bytes(), "text/plain").await {
-            let _ = tx.send(AppMessage::Status(format!("Saving secret failed: {e}"), true));
-            return;
-        }
+        item.set_secret(secret.as_bytes(), "text/plain")
+            .await
+            .map_err(|e| format!("Saving secret failed: {e}"))?;
     }
     let _ = tx.send(AppMessage::Status(format!("Saved \"{label}\""), false));
     load_entries(ss, tx).await;
     let _ = tx.send(AppMessage::SelectPath(path));
+    Ok(())
 }
 
-async fn delete_item(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppMessage>, path: String) {
-    let item = match resolve_item(ss, &path).await {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = tx.send(AppMessage::Status(e, true));
-            return;
-        }
-    };
-    match item.delete().await {
-        Ok(()) => {
-            let _ = tx.send(AppMessage::Status("Entry deleted".to_string(), false));
-            load_entries(ss, tx).await;
-        }
-        Err(e) => {
-            let _ = tx.send(AppMessage::Status(format!("Delete failed: {e}"), true));
-        }
-    }
+async fn delete_item(
+    ss: &SecretService<'_>,
+    tx: &calloop::channel::Sender<AppMessage>,
+    path: String,
+) -> Result<(), String> {
+    let item = resolve_item(ss, &path).await?;
+    item.delete().await.map_err(|e| format!("Delete failed: {e}"))?;
+    let _ = tx.send(AppMessage::Status("Entry deleted".to_string(), false));
+    load_entries(ss, tx).await;
+    Ok(())
 }
 
 // ── Application ───────────────────────────────────────────────────────────
