@@ -16,6 +16,9 @@
 //! - attribute names match cce-secrets and KeePassXC's own Secret Service
 //!   bridge: label=Title, UserName, URL, Notes, plus kdbx-uuid / kdbx-group.
 
+mod adopt;
+mod op;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -25,7 +28,7 @@ use secret_service::{EncryptionType, SecretService};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_KDBX: &str = "Dropbox/Codes/Passwords.kdbx";
-const APP: &str = "cce-keyring-sync";
+pub(crate) const APP: &str = "cce-keyring-sync";
 
 /// One kdbx entry, flattened to what round-trips (KEYRING-SYNC.md: TOTP,
 /// attachments and history deliberately stay kdbx-side).
@@ -41,23 +44,36 @@ struct KdbxEntry {
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct State {
-    version: u32,
-    kdbx_path: String,
-    last_run: i64,
-    /// Per kdbx UUID: the last-synced snapshot phase 2 merges against.
-    entries: HashMap<String, EntryState>,
+pub(crate) struct State {
+    pub version: u32,
+    pub kdbx_path: String,
+    pub last_run: i64,
+    /// Which interchange the base snapshot belongs to: "" (kdbx, the
+    /// original) or "onepassword" (set by `adopt`). The two key `entries`
+    /// differently — kdbx UUID vs 1Password item id — so a snapshot is only
+    /// ever meaningful to its own backend.
+    #[serde(default)]
+    pub backend: String,
+    /// 1Password only: the vault new entries are created in.
+    #[serde(default)]
+    pub vault: String,
+    /// Per entry id: the last-synced snapshot the merge runs against.
+    pub entries: HashMap<String, EntryState>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct EntryState {
+pub(crate) struct EntryState {
     /// Keyed blake3 over the canonical field concatenation — never values.
-    h: String,
-    kdbx_mtime: i64,
-    keyring_modified: u64,
+    pub h: String,
+    pub kdbx_mtime: i64,
+    pub keyring_modified: u64,
+    /// 1Password's `updated_at` at the base, verbatim. Empty means unknown:
+    /// the next sync fetches the entry regardless of the list timestamp.
+    #[serde(default)]
+    pub op_updated_at: String,
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -70,7 +86,7 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("HOME"))
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -169,7 +185,7 @@ fn attrs_for(e: &KdbxEntry) -> HashMap<&str, &str> {
 /// A secret held as a keyring item under our own application attribute:
 /// the kdbx master password and the state-file hash key both live this way,
 /// unlocked by PAM along with everything else.
-async fn keyring_get(
+pub(crate) async fn keyring_get(
     ss: &SecretService<'_>,
     purpose: &str,
 ) -> Result<Option<Vec<u8>>, secret_service::Error> {
@@ -212,19 +228,39 @@ async fn main() {
         .position(|a| a == "--kdbx")
         .and_then(|i| args.get(i + 1))
         .cloned();
-    let cmd = args
+    let vault_flag = args
         .iter()
-        .find(|a| !a.starts_with("--") && Some(a.as_str()) != kdbx_flag.as_deref().map(|_| "").or(None))
+        .position(|a| a == "--vault")
+        .and_then(|i| args.get(i + 1))
         .cloned();
+    // The subcommand: the first word that is neither a flag nor a flag's value.
+    let mut skip_next = false;
+    let mut cmd = None;
+    for a in &args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--kdbx" || a == "--vault" {
+            skip_next = true;
+            continue;
+        }
+        if !a.starts_with("--") {
+            cmd = Some(a.clone());
+            break;
+        }
+    }
     let cmd = match cmd.as_deref() {
         Some("import") => "import",
         Some("sync") => "sync",
         Some("doctor") => "doctor",
         Some("status") => "status",
+        Some("adopt") => "adopt",
         _ => {
             eprintln!("usage: cce-keyring-sync sync   [--dry-run] [--kdbx <path>]");
             eprintln!("       cce-keyring-sync import [--dry-run] [--kdbx <path>]");
             eprintln!("       cce-keyring-sync doctor [--kdbx <path>]");
+            eprintln!("       cce-keyring-sync adopt  [--dry-run] [--vault <name>]   (pair the keyring with 1Password)");
             eprintln!("       cce-keyring-sync status");
             std::process::exit(2);
         }
@@ -241,13 +277,32 @@ async fn main() {
         .or_else(|| (!state.kdbx_path.is_empty()).then(|| PathBuf::from(&state.kdbx_path)))
         .unwrap_or_else(|| home().join(DEFAULT_KDBX));
 
+    let onepassword = state.backend == "onepassword";
     if cmd == "status" {
-        println!("kdbx:      {}", kdbx.display());
+        if onepassword {
+            println!("backend:   1Password (vault {})", if state.vault.is_empty() { "*" } else { &state.vault });
+        } else {
+            println!("backend:   kdbx");
+            println!("kdbx:      {}", kdbx.display());
+        }
         println!("state:     {} entries, last run {}", state.entries.len(), state.last_run);
-        for c in conflicted_copies(&kdbx) {
-            println!("CONFLICT:  {}", c.display());
+        if !onepassword {
+            for c in conflicted_copies(&kdbx) {
+                println!("CONFLICT:  {}", c.display());
+            }
         }
         return;
+    }
+    if cmd == "adopt" {
+        adopt::adopt(&state_path, state, vault_flag.as_deref().unwrap_or(""), dry_run).await;
+        return;
+    }
+    if onepassword {
+        // The kdbx paths key their base by kdbx UUID; running one against a
+        // 1Password base would re-plan every entry from nothing.
+        eprintln!("the sync base belongs to the 1Password backend; `{cmd}` is kdbx-only");
+        eprintln!("(phase 2's daemon is not built yet — see KEYRING-SYNC.md)");
+        std::process::exit(1);
     }
 
     if cmd == "doctor" {
@@ -437,7 +492,7 @@ async fn main() {
         };
         state.entries.insert(
             e.uuid.clone(),
-            EntryState { h: canonical_hash(&hash_key, e), kdbx_mtime: e.mtime, keyring_modified: modified },
+            EntryState { h: canonical_hash(&hash_key, e), kdbx_mtime: e.mtime, keyring_modified: modified, op_updated_at: String::new() },
         );
     }
 
@@ -469,18 +524,20 @@ async fn main() {
 // ===================== phase 2: bidirectional sync =====================
 
 /// A keyring item's synced fields, snapshotted once per run.
-struct KrEntry {
-    title: String,
-    username: String,
-    password: String,
-    url: String,
-    notes: String,
-    group: String,
-    modified: u64,
+#[derive(Clone)]
+pub(crate) struct KrEntry {
+    pub title: String,
+    pub username: String,
+    pub password: String,
+    pub url: String,
+    pub notes: String,
+    /// kdbx: the group name; 1Password: the vault name.
+    pub group: String,
+    pub modified: u64,
 }
 
 impl KrEntry {
-    fn hash(&self, key: &[u8; 32]) -> String {
+    pub fn hash(&self, key: &[u8; 32]) -> String {
         let mut h = blake3::Hasher::new_keyed(key);
         for part in [&self.title, &self.username, &self.password, &self.url, &self.notes, &self.group] {
             h.update(part.as_bytes());
@@ -522,7 +579,7 @@ fn take_lock() -> Option<std::fs::File> {
     }
 }
 
-fn journal_append(lines: &str) {
+pub(crate) fn journal_append(lines: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1010,6 +1067,7 @@ async fn sync(kdbx_path: &Path, state_path: &Path, mut state: State, dry_run: bo
                 h: canonical_hash(&hash_key, e),
                 kdbx_mtime: e.mtime,
                 keyring_modified: fresh_kr.get(&e.uuid).copied().unwrap_or(0),
+                op_updated_at: String::new(),
             },
         );
     }
@@ -1025,7 +1083,7 @@ async fn sync(kdbx_path: &Path, state_path: &Path, mut state: State, dry_run: bo
     );
 }
 
-fn write_state(state_path: &Path, state: &State) {
+pub(crate) fn write_state(state_path: &Path, state: &State) {
     let _ = std::fs::create_dir_all(state_dir());
     let tmp = state_path.with_extension("json.tmp");
     if std::fs::write(&tmp, serde_json::to_vec_pretty(state).unwrap()).is_ok() {
