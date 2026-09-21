@@ -7,9 +7,8 @@
 //! [`OP_TIMEOUT`]: an unanswered Authorize dialog holds `op` for 60 s before
 //! it gives up, and a wedged app must not hold a tick forever.
 //!
-//! The `Interchange` trait is the shape the merge loop will call in phase 2;
-//! the kdbx backend joins it when `sync` is rewired, not before — an
-//! unexercised impl is dead code.
+//! The `Interchange` trait is what the merge loop (sync.rs) calls; 1Password
+//! is its only implementation since the kdbx backend retired.
 
 use std::time::Duration;
 
@@ -68,7 +67,7 @@ pub trait Interchange {
     /// returns the entry's new timestamp text, so the base can record it
     /// without another fetch.
     async fn update(&mut self, e: &RemoteEntry) -> Result<String, String>;
-    /// Soft-delete: 1Password's Archive, the kdbx's Recycle Bin.
+    /// Soft-delete: 1Password's Archive.
     async fn recycle(&mut self, id: &str) -> Result<(), String>;
 }
 

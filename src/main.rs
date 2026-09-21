@@ -15,8 +15,8 @@ const BTN_W: f32 = 90.0;
 const BTN_H: f32 = 28.0;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 
-/// Entry fields written back as Secret Service attributes (KeePassXC maps
-/// them onto its UserName / URL / Notes entry fields; Title is the label).
+/// Entry fields written back as Secret Service attributes (cce-keyring-sync
+/// mirrors them to 1Password's username / url / notes; Title is the label).
 const EDIT_ATTRS: [&str; 3] = ["UserName", "URL", "Notes"];
 
 /// One Secret Service item, sans secret: the secret itself is fetched on
@@ -58,9 +58,8 @@ enum Purpose {
 #[derive(Clone)]
 enum Cmd {
     Reload,
-    /// Run one `cce-keyring-sync sync` pass and reload. The sync logic stays
-    /// in the one binary the timer also runs; the UI only invokes it, so the
-    /// flock naturally serializes a button press against a timer tick.
+    /// Ask cce-keyring-sync for a pass and reload — the resident daemon
+    /// when it runs, the one-shot binary otherwise (see `run_sync`).
     Sync,
     GetSecret { path: String, purpose: Purpose },
     CreateItem { label: String, attrs: Vec<(String, String)>, secret: String },
@@ -208,7 +207,7 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
                 Ok(ss) => ss,
                 Err(e) => {
                     let _ = tx.send(AppMessage::Status(
-                        format!("Secret Service unavailable: {e} — is KeePassXC running with Secret Service integration enabled?"),
+                        format!("Secret Service unavailable: {e} — is gnome-keyring running?"),
                         true,
                     ));
                     return;
@@ -293,12 +292,12 @@ async fn load_entries(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppM
     let mut entries = Vec::new();
     for col in &collections {
         let label = col.get_label().await.unwrap_or_else(|_| "collection".to_string());
-        // Locked collection: unlocking prompts through the daemon (KeePassXC
-        // raises its own dialog and this await blocks until it's answered);
-        // a refused prompt just skips the collection.
+        // Locked collection: unlocking prompts through the Secret Service
+        // provider (gnome-keyring raises its own dialog and this await blocks
+        // until it's answered); a refused prompt just skips the collection.
         if col.is_locked().await.unwrap_or(false) {
             let _ = tx.send(AppMessage::Status(
-                format!("Unlock \"{label}\" in KeePassXC to load its entries…"),
+                format!("Unlock \"{label}\" to load its entries…"),
                 false,
             ));
             if col.unlock().await.is_err() || col.is_locked().await.unwrap_or(true) {
@@ -786,7 +785,7 @@ impl Application for SecretsApp {
                 }
                 self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
                 self.status_msg = if self.entries.is_empty() {
-                    "No entries — expose a KeePassXC group via Tools → Settings → Secret Service Integration".to_string()
+                    "No entries — run `cce-keyring-sync adopt --vault <name>` to seed the keyring from 1Password".to_string()
                 } else {
                     format!("{} entries", self.entries.len())
                 };

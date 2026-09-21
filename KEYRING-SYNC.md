@@ -173,10 +173,12 @@ that is irrelevant, and there is no resident unlock to keep warm.
 
 # Scoping: 1Password as the interchange (option 1, 2026-09-21)
 
-Status: **phase 2 shipped (2026-09-21).** The resident daemon is the
+Status: **complete (2026-09-21).** The resident daemon is the
 `cce-keyring-sync.service` unit, ticking every five minutes against the
-Personal vault; the kdbx timer is gone. Phase 3 (retire the kdbx code) is
-what remains. Results per phase at the end of this file.
+Personal vault; the kdbx backend, `import`, `doctor`, the `keepass`
+dependency and the stored master password are gone. Everything above this
+line up to "Scoping: 1Password as the interchange" describes the retired
+kdbx design and is kept as history. Results per phase at the end.
 
 ## Goal
 
@@ -398,10 +400,13 @@ unacceptable however native the window is. Measure it before anything else
 2. ~~**`sync` on the new backend.**~~ **Done 2026-09-21**; results below.
    The table is exercised by `scripts/e2e-1password.sh` (isolated keyring,
    throwaway vault, every pass through one daemon), 19 checks.
-3. **Retire the kdbx path** after a month clean: delete the backend, the
-   `doctor` subcommand, the `keepass` dependency, and the master-password
-   keyring item. Update cce-secrets' "synced Nm ago" hint (it already reads
-   the state file; only the tooltip text names Dropbox).
+3. ~~**Retire the kdbx path** after a month clean~~ **Done 2026-09-21**,
+   the same day, on the person's call: the isolated run covered the table
+   and the daemon's live passes were quiet. Deleted the backend, `import`,
+   `doctor`, the `keepass` and `rpassword` dependencies, the `--kdbx`
+   flag, `State.kdbx_path` / `EntryState.kdbx_mtime` (unknown fields are
+   ignored on read, so the live base needed no migration), and the
+   master-password keyring item. main.rs went from 1198 lines to 242.
 
 ## Open questions
 
@@ -611,3 +616,23 @@ What it found, and what was changed for it:
 Open question 4 (a locked app) is still open; the daemon's back-off is
 what happens in the meantime. Question 5 (the "top level process" the app
 looks for) is unneeded now.
+
+## Phase 3 results (2026-09-21)
+
+`cce-keyring-sync` is now `adopt`, `sync`, `daemon`, `status` — 1,830
+lines across main.rs, op.rs, sync.rs, adopt.rs, daemon.rs, with 19 unit
+tests and `scripts/e2e-1password.sh` for the table. The kdbx file in
+Dropbox is untouched and still serves other machines and phones; nothing
+here reads or writes it any more. The `kdbx-uuid` / `kdbx-group`
+attributes remain on the 168 adopted keyring items as inert history. The
+kdbx-era base is at `state.json.kdbx-1790007276` beside the live state
+file, should anyone want the old pairing back.
+
+Rolling back to the kdbx design would mean checking out 0bac2e9^ and
+re-importing the master password; the design above documents how that
+worked. Nothing in cce-secrets or cce-browser changed shape in any phase:
+both still front gnome-keyring over the Secret Service, which was the
+point of choosing a mirror.
+
+Still open: question 4, what an `op` call sees against a locked app. The
+daemon's back-off covers the gap until it is measured.

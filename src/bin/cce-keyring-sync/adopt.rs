@@ -1,4 +1,4 @@
-//! `adopt` — the migration step the kdbx never needed.
+//! `adopt` — pair what both sides already hold, and seed the base.
 //!
 //! After the CSV import, both the keyring and 1Password hold the same
 //! entries with no link between them, so the first run must **pair, not
@@ -9,9 +9,7 @@
 //! cross-links two accounts — the one mistake the merge cannot undo later —
 //! so any duplicate refuses the whole run until a person has sorted it.
 //!
-//! The kdbx attributes are kept, deliberately: while the kdbx backend still
-//! exists, an accidental kdbx `sync` must keep pairing by uuid rather than
-//! see 171 orphans to re-create. Phase 3 drops them with the backend.
+//! Old `kdbx-*` attributes are left on the items; nothing reads them.
 
 use std::collections::HashMap;
 
@@ -188,7 +186,7 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
         std::process::exit(1);
     }
 
-    // The keyring's logins: anything cce-secrets or the kdbx import wrote.
+    // The keyring's logins: anything cce-secrets (or an earlier importer) wrote.
     let mut locals: Vec<Local<'_>> = Vec::new();
     match col.get_all_items().await {
         Ok(items) => {
@@ -376,19 +374,17 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
             r.id.clone(),
             EntryState {
                 h: base.hash(&hash_key),
-                kdbx_mtime: 0,
                 keyring_modified: l.entry.modified,
                 op_updated_at: if differing.contains(&li) { String::new() } else { r.updated_raw.clone() },
             },
         );
     }
 
-    // The kdbx base is not thrown away: sync under the old backend could
-    // still be wanted if this migration is rolled back.
+    // A pre-existing base of another shape is kept aside, not overwritten.
     if state.backend != "onepassword" && state_path.exists() {
-        let backup = state_dir().join(format!("state.json.kdbx-{}", now_unix()));
+        let backup = state_dir().join(format!("state.json.old-{}", now_unix()));
         if std::fs::copy(state_path, &backup).is_ok() {
-            println!("kdbx sync state backed up to {}", backup.display());
+            println!("previous sync state backed up to {}", backup.display());
         }
     }
     state.version = 2;
@@ -399,7 +395,6 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
     write_state(state_path, &state);
     crate::journal_append(&format!("{} adopt stamped {stamped} entries (1Password, vault {vault})\n", now_unix()));
     println!("\nadopted: {stamped} entries stamped; backend is now 1Password");
-    println!("note: the kdbx timer should be stopped — `sync` refuses under this backend until the daemon lands (phase 2)");
 }
 
 #[cfg(test)]

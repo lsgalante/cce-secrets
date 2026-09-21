@@ -1,8 +1,8 @@
 //! The three-way merge against an `Interchange` — the 1Password path.
 //!
 //! Same table as KEYRING-SYNC.md's, keyed by the interchange's item id
-//! (`op-item` on the keyring side). What differs from the kdbx `sync` in
-//! main.rs: there is no file, so nothing is batched — every remote write is
+//! (`op-item` on the keyring side). Unlike the kdbx merge this replaced,
+//! there is no file, so nothing is batched — every remote write is
 //! one `op` call, and the first remote failure stops the apply loop with the
 //! base snapshot kept for everything not yet applied, so the next run
 //! re-plans from the same place. Conflict losers need no History push:
@@ -313,7 +313,6 @@ pub async fn sync_remote<I: Interchange>(
 
     let snapshot = |k: &KrEntry, updated_raw: String, keyring_modified: u64| EntryState {
         h: k.hash(&hash_key),
-        kdbx_mtime: 0,
         keyring_modified,
         op_updated_at: updated_raw,
     };
