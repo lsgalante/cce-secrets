@@ -493,6 +493,9 @@ struct SecretsApp {
     /// state file. Cached — the file is only re-read every few seconds.
     sync_hint: String,
     sync_hint_at: Option<std::time::Instant>,
+    /// A Sync pass is in flight: the reload it ends with must not replace
+    /// "Syncing…" with "N entries" before the result line arrives.
+    syncing: bool,
 
     cmd_tx: std::sync::mpsc::Sender<Cmd>,
     cmd_rx: Option<std::sync::mpsc::Receiver<Cmd>>,
@@ -751,6 +754,7 @@ impl Application for SecretsApp {
             status_is_error: false,
             sync_hint: String::new(),
             sync_hint_at: None,
+            syncing: false,
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             sender,
@@ -786,6 +790,9 @@ impl Application for SecretsApp {
                     self.selected = None;
                 }
                 self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+                if self.syncing {
+                    return;
+                }
                 self.status_msg = if self.entries.is_empty() {
                     "No entries — run `cce-keyring-sync adopt --vault <name>` to seed the keyring from 1Password".to_string()
                 } else {
@@ -794,6 +801,7 @@ impl Application for SecretsApp {
                 self.status_is_error = false;
             }
             AppMessage::Status(msg, is_error) => {
+                self.syncing = false;
                 self.status_msg = msg;
                 self.status_is_error = is_error;
             }
@@ -811,6 +819,7 @@ impl Application for SecretsApp {
                 let _ = self.cmd_tx.send(Cmd::Reload);
             }
             AppMessage::SyncClicked => {
+                self.syncing = true;
                 self.status_msg = "Syncing…".to_string();
                 self.status_is_error = false;
                 let _ = self.cmd_tx.send(Cmd::Sync);
