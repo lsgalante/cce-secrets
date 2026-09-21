@@ -173,9 +173,10 @@ that is irrelevant, and there is no resident unlock to keep warm.
 
 # Scoping: 1Password as the interchange (option 1, 2026-09-21)
 
-Status: **phase 0 measured (2026-09-21), nothing built.** App and `op`
-installed, integrated, signed in. The oneshot timer does not survive the
-measurements; see "Phase 0 results" at the end.
+Status: **phase 1 shipped (2026-09-21).** `adopt` paired 168 of 171 keyring
+logins with 1Password and the base is keyed by item id; the kdbx timer is
+stopped and `sync` refuses until phase 2's daemon. See "Phase 0 results"
+and "Phase 1 results" at the end.
 
 ## Goal
 
@@ -299,7 +300,10 @@ several vaults can be mirrored, each entry keeping its `op-vault`.
 `adopt` is the migration step the kdbx never needed: the keyring already
 holds the 168 entries, and after the CSV import so does 1Password, so the
 first run must **pair, not copy**. Match on (title, username), exact and
-case-sensitive; stamp `op-item`/`op-vault` on the match, drop `kdbx-*`; print
+case-sensitive, with the url as the tiebreaker when that alone is
+ambiguous; stamp `op-item`/`op-vault` on the match (the `kdbx-*`
+attributes stay until the kdbx backend retires, so an accidental kdbx run
+still pairs by uuid instead of re-creating everything); print
 every entry unmatched on either side and stop there. Duplicated
 (title, username) pairs on either side are refused, listed, and left to the
 person — a wrong pairing here silently cross-links two accounts, which is
@@ -387,10 +391,10 @@ unacceptable however native the window is. Measure it before anything else
    from a `systemd-run --user` unit; time how long the authorization lasts
    and whether the prompt appears in `cce-authenticator`.~~ **Done 2026-09-21,
    results below.** The timer is dead; the daemon replaces it.
-1. **`Interchange` trait + `OnePassword` backend + `adopt --dry-run`.** The
-   kdbx backend moves behind the trait unchanged; `cargo test` on the
-   pairing logic against a fixture list. `adopt` for real once the dry run
-   pairs 168/168 (or the leftovers are explained).
+1. ~~**`Interchange` trait + `OnePassword` backend + `adopt --dry-run`.**~~
+   **Done 2026-09-21** (fab49c8, 28c7389); results below. The kdbx backend
+   did *not* move behind the trait yet — an unexercised impl is dead code;
+   it joins when phase 2 rewires `sync`.
 2. **`sync` on the new backend.** Exercise the full table in an isolated
    `dbus-run-session` keyring against a throwaway vault, as phase 2 above
    did against a fixture kdbx: edit both ways, delete both ways, conflict,
@@ -405,8 +409,9 @@ unacceptable however native the window is. Measure it before anything else
 
 1. Which vault(s) to mirror — Personal only, or everything `op item list`
    can read?
-2. `adopt` match key: (title, username) exact, or also fall back to URL
-   host + username for retitled entries?
+2. ~~`adopt` match key: (title, username) exact, or also fall back to URL
+   host + username for retitled entries?~~ Answered: url as the tiebreaker
+   for duplicate (title, username) only — two Microsoft tenants needed it.
 3. Does the CSV round trip carry TOTP seeds, and should
    `cce-authenticator` then read them from 1Password directly (its own
    decision, as before)?
@@ -512,3 +517,53 @@ app's approval entirely.
    present as one, the authorization might be remembered across restarts
    the way it is for a terminal window. Not needed for the design; nice
    if cheap.
+
+## Phase 1 results (2026-09-21)
+
+`cce-keyring-sync adopt --vault Personal` against the live keyring and the
+freshly imported vault:
+
+| | |
+| --- | --- |
+| keyring logins | 171 |
+| 1Password logins after cleanup | 172 |
+| paired and stamped | **168** |
+| 1Password only | 4: 1Password's own account item, `secure.bankofamerica.com` (was in the kdbx Recycle Bin — the CSV export carries the bin), and two test entries |
+| keyring only | 3: two `…@cce-mail:default` items cce-mail writes with a `UserName` attribute, and one test entry |
+| field drift on a pair | 1 (notes) — base timestamp left unknown so the first sync takes 1Password's value |
+
+The 168 all pair on exact (title, username); four needed the url tiebreaker
+(two Microsoft tenants, two xferrecords accounts). The first dry run
+refused on 23 import artefacts — Recycle Bin entries the CSV export had
+resurrected, eight copies of one test login among them — which were
+archived in 1Password by hand; the per-copy report (url, timestamp, id)
+is what made that a five-minute job.
+
+Things learned that phase 2 has to carry:
+
+- **The Authorize dialog can be hidden.** It is a 400×370 floating window
+  the app raises via xdg-activation at the same origin as its main window;
+  when the main window was opened later it sat on top, and three dialogs
+  in a row timed out unseen while the app log showed each one shown. Focus
+  went to the dialog; the compositor did not raise it. Filed against
+  cce-compositor. Until fixed: keep the main 1Password window closed or
+  moved when a sync is expected to prompt.
+- **`1Password Account (…)` must never be mirrored.** It is the item
+  1Password creates for the account itself — Secret Key and account
+  password inside. The sync's "1Password only → keyring" rule would copy
+  it into gnome-keyring. Phase 2 skips it (title prefix `1Password
+  Account`; better, its `category` if the list ever distinguishes it).
+- **cce-mail's keyring items look like logins** (they carry `UserName`),
+  so the sync will create them in 1Password at the first run, as the kdbx
+  sync adopted them before (that is where the `…@cce-email:default`
+  debris in the CSV came from). Either accept that — mail passwords in
+  1Password are not wrong — or have phase 2 exclude items whose label
+  matches `*@cce-mail:*`. Decide before the first real sync.
+- **The old binary must never see the new state.** The version-2 base is
+  keyed by item id; the kdbx `sync` reading it would treat every kdbx
+  entry as never seen and re-create all of them in the keyring. Hence the
+  install-before-adopt order, the `backend` guard in every kdbx path, and
+  the backup `state.json.kdbx-<ts>` for a rollback (restore it and
+  re-enable the timer; the stamps are harmless to the kdbx path).
+- The cce-secrets Sync button now runs a `sync` that refuses; its status
+  line shows the refusal text until the daemon lands.
