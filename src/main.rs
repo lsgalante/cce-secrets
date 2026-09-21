@@ -137,7 +137,10 @@ async fn poke_sync_daemon() -> bool {
 /// file to record a new run, then show that run's outcome. Without it: the
 /// one-shot binary, whose summary line ("synced: …", "in sync") or
 /// refusal text is the status.
-async fn run_sync(tx: &calloop::channel::Sender<AppMessage>) {
+/// Returns the status line (text, is_error). The caller shows it *after*
+/// the reload that follows a sync, or the reload's "N entries" would wipe
+/// it a frame later.
+async fn run_sync() -> (String, bool) {
     let before = read_sync_state().map(|(t, _)| t).unwrap_or(0);
     if poke_sync_daemon().await {
         // A pass is one `op item list` plus writes; a dialog nobody
@@ -148,13 +151,11 @@ async fn run_sync(tx: &calloop::channel::Sender<AppMessage>) {
                 if t > before {
                     let is_error = result.starts_with("failed");
                     let msg = if result.is_empty() { "synced".to_string() } else { result };
-                    let _ = tx.send(AppMessage::Status(msg, is_error));
-                    return;
+                    return (msg, is_error);
                 }
             }
         }
-        let _ = tx.send(AppMessage::Status("sync daemon did not report within 90s".to_string(), true));
-        return;
+        return ("sync daemon did not report within 90s".to_string(), true);
     }
     let out = tokio::process::Command::new("cce-keyring-sync")
         .arg("sync")
@@ -173,15 +174,15 @@ async fn run_sync(tx: &calloop::channel::Sender<AppMessage>) {
             if out.status.success() {
                 let line = pick(&out.stdout);
                 let msg = if line.is_empty() { "synced".to_string() } else { line };
-                let _ = tx.send(AppMessage::Status(msg, false));
+                return (msg, false);
             } else {
                 let line = pick(&out.stderr);
                 let msg = if line.is_empty() { "sync failed".to_string() } else { line };
-                let _ = tx.send(AppMessage::Status(msg, true));
+                return (msg, true);
             }
         }
         Err(e) => {
-            let _ = tx.send(AppMessage::Status(format!("cce-keyring-sync not runnable: {e}"), true));
+            return (format!("cce-keyring-sync not runnable: {e}"), true);
         }
     }
 }
@@ -218,8 +219,9 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
                 match cmd {
                     Cmd::Reload => load_entries(&ss, &tx).await,
                     Cmd::Sync => {
-                        run_sync(&tx).await;
+                        let (msg, is_error) = run_sync().await;
                         load_entries(&ss, &tx).await;
+                        let _ = tx.send(AppMessage::Status(msg, is_error));
                     }
                     op => {
                         let edits = matches!(op, Cmd::CreateItem { .. } | Cmd::UpdateItem { .. } | Cmd::DeleteItem { .. });
