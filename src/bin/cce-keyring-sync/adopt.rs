@@ -25,8 +25,20 @@ pub const OP_ITEM_ATTR: &str = "op-item";
 /// Keyring attribute holding the item's vault name.
 pub const OP_VAULT_ATTR: &str = "op-vault";
 
-/// Pairing key: exact (title, username).
-pub type Key = (String, String);
+/// Pairing key: exact (title, username), with the url as the tiebreaker
+/// when the pair alone is ambiguous (KEYRING-SYNC.md open question 2).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Key {
+    pub title: String,
+    pub username: String,
+    pub url: String,
+}
+
+impl Key {
+    fn short(&self) -> (String, String) {
+        (self.title.clone(), self.username.clone())
+    }
+}
 
 /// The pairing plan for one side's keys against the other's.
 #[derive(Debug, Default, PartialEq)]
@@ -67,44 +79,65 @@ pub fn pair(local: &[Key], remote: &[Key], pinned: &[(usize, String)], remote_id
         }
     }
 
-    let count = |keys: &[Key], taken: &[bool]| -> HashMap<Key, Vec<usize>> {
-        let mut m: HashMap<Key, Vec<usize>> = HashMap::new();
+    // One pass per key width: what is unique on both sides under the short
+    // key pairs; what is not gets a second chance with the url included.
+    fn pass<K: std::hash::Hash + Eq + Clone>(
+        key: impl Fn(&Key) -> K,
+        local: &[Key],
+        remote: &[Key],
+        local_taken: &mut [bool],
+        remote_taken: &mut [bool],
+        pairs: &mut Vec<(usize, usize)>,
+    ) {
+        let count = |keys: &[Key], taken: &[bool]| -> HashMap<K, Vec<usize>> {
+            let mut m: HashMap<K, Vec<usize>> = HashMap::new();
+            for (i, k) in keys.iter().enumerate() {
+                if !taken[i] {
+                    m.entry(key(k)).or_default().push(i);
+                }
+            }
+            m
+        };
+        let lmap = count(local, local_taken);
+        let rmap = count(remote, remote_taken);
+        for (i, k) in local.iter().enumerate() {
+            if local_taken[i] {
+                continue;
+            }
+            let k = key(k);
+            if let (Some([ri]), Some([_])) = (rmap.get(&k).map(Vec::as_slice), lmap.get(&k).map(Vec::as_slice)) {
+                pairs.push((i, *ri));
+                local_taken[i] = true;
+                remote_taken[*ri] = true;
+            }
+        }
+    }
+    pass(Key::short, local, remote, &mut local_taken, &mut remote_taken, &mut plan.pairs);
+    pass(Key::clone, local, remote, &mut local_taken, &mut remote_taken, &mut plan.pairs);
+
+    // Whatever is still untaken and shares its short key with another
+    // untaken entry on the same side is a duplicate the person must sort.
+    let dups = |keys: &[Key], taken: &[bool]| -> Vec<Key> {
+        let mut m: HashMap<(String, String), Vec<usize>> = HashMap::new();
         for (i, k) in keys.iter().enumerate() {
             if !taken[i] {
-                m.entry(k.clone()).or_default().push(i);
+                m.entry(k.short()).or_default().push(i);
             }
         }
-        m
-    };
-    let lmap = count(local, &local_taken);
-    let rmap = count(remote, &remote_taken);
-
-    let dups = |m: &HashMap<Key, Vec<usize>>| -> Vec<Key> {
-        let mut d: Vec<Key> = m.iter().filter(|(_, v)| v.len() > 1).map(|(k, _)| k.clone()).collect();
+        let mut d: Vec<Key> = m
+            .values()
+            .filter(|v| v.len() > 1)
+            .flat_map(|v| v.iter().map(|&i| keys[i].clone()))
+            .collect();
         d.sort();
+        d.dedup();
         d
     };
-    plan.dup_local = dups(&lmap);
-    plan.dup_remote = dups(&rmap);
+    plan.dup_local = dups(local, &local_taken);
+    plan.dup_remote = dups(remote, &remote_taken);
 
-    for (i, k) in local.iter().enumerate() {
-        if local_taken[i] {
-            continue;
-        }
-        match rmap.get(k) {
-            Some(r) if r.len() == 1 && lmap.get(k).map(Vec::len) == Some(1) => {
-                plan.pairs.push((i, r[0]));
-                local_taken[i] = true;
-                remote_taken[r[0]] = true;
-            }
-            _ => plan.unmatched_local.push(i),
-        }
-    }
-    for (i, _) in remote.iter().enumerate() {
-        if !remote_taken[i] {
-            plan.unmatched_remote.push(i);
-        }
-    }
+    plan.unmatched_local = (0..local.len()).filter(|&i| !local_taken[i]).collect();
+    plan.unmatched_remote = (0..remote.len()).filter(|&i| !remote_taken[i]).collect();
     plan.pairs.sort();
     plan
 }
@@ -187,8 +220,14 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
     };
     println!("1Password: {} logins{}", summaries.len(), if vault.is_empty() { String::new() } else { format!(" in {vault}") });
 
-    let lkeys: Vec<Key> = locals.iter().map(|l| (l.entry.title.clone(), l.entry.username.clone())).collect();
-    let rkeys: Vec<Key> = summaries.iter().map(|r| (r.title.clone(), r.username.clone())).collect();
+    let lkeys: Vec<Key> = locals
+        .iter()
+        .map(|l| Key { title: l.entry.title.clone(), username: l.entry.username.clone(), url: l.entry.url.clone() })
+        .collect();
+    let rkeys: Vec<Key> = summaries
+        .iter()
+        .map(|r| Key { title: r.title.clone(), username: r.username.clone(), url: r.url.clone() })
+        .collect();
     let rids: Vec<String> = summaries.iter().map(|r| r.id.clone()).collect();
     let pinned: Vec<(usize, String)> = locals
         .iter()
@@ -197,17 +236,43 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
         .collect();
     let plan = pair(&lkeys, &rkeys, &pinned, &rids);
 
-    let show = |k: &Key| if k.1.is_empty() { k.0.clone() } else { format!("{}  ({})", k.0, k.1) };
+    let show = |k: &Key| if k.username.is_empty() { k.title.clone() } else { format!("{}  ({})", k.title, k.username) };
+    let when = |t: u64| -> String {
+        // Local time is not worth a dependency; the date alone tells copies apart.
+        let d = t / 86400;
+        let (mut y, mut rem) = (1970u64, d);
+        loop {
+            let len = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+            if rem < len {
+                break;
+            }
+            rem -= len;
+            y += 1;
+        }
+        format!("{y}+{rem}d {:02}:{:02}", (t % 86400) / 3600, (t % 3600) / 60)
+    };
+    // Duplicates are the person's call, so show what tells the copies apart.
+    let dup_keys = |d: &[Key]| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = d.iter().map(Key::short).collect();
+        v.dedup();
+        v
+    };
     if !plan.dup_local.is_empty() {
-        println!("\nDUPLICATE (title, username) in the keyring — cannot pair safely:");
-        for k in &plan.dup_local {
-            println!("  {}", show(k));
+        println!("\nDUPLICATE (title, username) in the keyring — same url too, so nothing tells them apart:");
+        for (t, u) in dup_keys(&plan.dup_local) {
+            println!("  {}", show(&Key { title: t.clone(), username: u.clone(), url: String::new() }));
+            for l in locals.iter().filter(|l| l.entry.title == t && l.entry.username == u) {
+                println!("      url {:<40} modified {}  group {}", l.entry.url, when(l.entry.modified), l.attrs.get("kdbx-group").map(String::as_str).unwrap_or("-"));
+            }
         }
     }
     if !plan.dup_remote.is_empty() {
-        println!("\nDUPLICATE (title, username) in 1Password — archive the stale copy, then retry:");
-        for k in &plan.dup_remote {
-            println!("  {}", show(k));
+        println!("\nDUPLICATE (title, username) in 1Password — archive the stale copies, then retry:");
+        for (t, u) in dup_keys(&plan.dup_remote) {
+            println!("  {}", show(&Key { title: t.clone(), username: u.clone(), url: String::new() }));
+            for r in summaries.iter().filter(|r| r.title == t && r.username == u) {
+                println!("      url {:<40} updated {}  id {}", r.url, r.updated_raw, r.id);
+            }
         }
     }
     if !plan.unmatched_remote.is_empty() {
@@ -333,7 +398,32 @@ mod tests {
     use super::*;
 
     fn k(t: &str, u: &str) -> Key {
-        (t.to_string(), u.to_string())
+        Key { title: t.to_string(), username: u.to_string(), url: String::new() }
+    }
+
+    fn ku(t: &str, u: &str, url: &str) -> Key {
+        Key { title: t.to_string(), username: u.to_string(), url: url.to_string() }
+    }
+
+    #[test]
+    fn the_url_breaks_a_tie_when_it_can() {
+        let local = vec![ku("MS", "me", "https://a.example"), ku("MS", "me", "https://b.example")];
+        let remote = vec![ku("MS", "me", "https://b.example"), ku("MS", "me", "https://a.example")];
+        let ids = vec!["r0".into(), "r1".into()];
+        let p = pair(&local, &remote, &[], &ids);
+        assert_eq!(p.pairs, vec![(0, 1), (1, 0)]);
+        assert!(!p.refused());
+    }
+
+    #[test]
+    fn identical_urls_stay_ambiguous() {
+        let local = vec![ku("MS", "me", "https://a.example"), ku("MS", "me", "https://a.example")];
+        let remote = vec![ku("MS", "me", "https://a.example"), ku("MS", "me", "https://a.example")];
+        let ids = vec!["r0".into(), "r1".into()];
+        let p = pair(&local, &remote, &[], &ids);
+        assert!(p.refused());
+        assert!(p.pairs.is_empty());
+        assert_eq!(p.dup_local.len(), 1, "reported once per key, not per copy");
     }
 
     #[test]
@@ -370,6 +460,7 @@ mod tests {
         assert_eq!(p.dup_remote, vec![k("Mail", "a")]);
         assert!(p.pairs.is_empty(), "an ambiguous key never pairs, even its single-sided partner");
         assert_eq!(p.unmatched_local, vec![0, 1, 2]);
+        assert_eq!(p.unmatched_remote, vec![0, 1, 2]);
     }
 
     #[test]
