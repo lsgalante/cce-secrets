@@ -160,11 +160,20 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
             std::process::exit(1);
         }
     };
+    // The state-file hash key: minted once, kept in the keyring so the
+    // state file alone leaks nothing (a fresh keyring has none yet).
     let hash_key: [u8; 32] = match keyring_get(&ss, "state-hash-key").await {
         Ok(Some(b)) if b.len() == 32 => b.try_into().unwrap(),
         _ => {
-            eprintln!("no state hash key — run `cce-keyring-sync import` once (kdbx) first");
-            std::process::exit(1);
+            let mut k = [0u8; 32];
+            getrandom::getrandom(&mut k).expect("entropy");
+            if !dry_run {
+                if let Err(e) = crate::keyring_put(&ss, "state-hash-key", "cce-keyring-sync: state hash key", &k).await {
+                    eprintln!("could not store the hash key: {e}");
+                    std::process::exit(1);
+                }
+            }
+            k
         }
     };
     let col = match ss.get_default_collection().await {

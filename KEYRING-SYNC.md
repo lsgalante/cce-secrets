@@ -173,10 +173,10 @@ that is irrelevant, and there is no resident unlock to keep warm.
 
 # Scoping: 1Password as the interchange (option 1, 2026-09-21)
 
-Status: **phase 1 shipped (2026-09-21).** `adopt` paired 168 of 171 keyring
-logins with 1Password and the base is keyed by item id; the kdbx timer is
-stopped and `sync` refuses until phase 2's daemon. See "Phase 0 results"
-and "Phase 1 results" at the end.
+Status: **phase 2 shipped (2026-09-21).** The resident daemon is the
+`cce-keyring-sync.service` unit, ticking every five minutes against the
+Personal vault; the kdbx timer is gone. Phase 3 (retire the kdbx code) is
+what remains. Results per phase at the end of this file.
 
 ## Goal
 
@@ -395,11 +395,9 @@ unacceptable however native the window is. Measure it before anything else
    **Done 2026-09-21** (fab49c8, 28c7389); results below. The kdbx backend
    did *not* move behind the trait yet — an unexercised impl is dead code;
    it joins when phase 2 rewires `sync`.
-2. **`sync` on the new backend.** Exercise the full table in an isolated
-   `dbus-run-session` keyring against a throwaway vault, as phase 2 above
-   did against a fixture kdbx: edit both ways, delete both ways, conflict,
-   new-entry adoption both ways, mid-apply `op` failure. Then flip the timer
-   (cadence per phase 0) and stop the kdbx timer.
+2. ~~**`sync` on the new backend.**~~ **Done 2026-09-21**; results below.
+   The table is exercised by `scripts/e2e-1password.sh` (isolated keyring,
+   throwaway vault, every pass through one daemon), 19 checks.
 3. **Retire the kdbx path** after a month clean: delete the backend, the
    `doctor` subcommand, the `keepass` dependency, and the master-password
    keyring item. Update cce-secrets' "synced Nm ago" hint (it already reads
@@ -567,3 +565,49 @@ Things learned that phase 2 has to carry:
   re-enable the timer; the stamps are harmless to the kdbx path).
 - The cce-secrets Sync button now runs a `sync` that refuses; its status
   line shows the refusal text until the daemon lands.
+
+## Phase 2 results (2026-09-21)
+
+Shipped: `sync.rs` (the merge against the `Interchange` trait, keyed by
+item id), `daemon.rs` (the resident loop), the `cce-keyring-sync.service`
+unit replacing the timer, and cce-secrets' Sync button and saves poking
+the daemon with `SIGUSR1` (falling back to the one-shot when no daemon
+runs). The kdbx `sync` in main.rs is untouched and unreachable under the
+1Password backend; it and the `keepass` dependency go in phase 3.
+
+The first live pass mirrored the four 1Password-only entries into the
+keyring (the account item excluded), created the three keyring-only ones
+in 1Password (the cce-mail credentials, kept by decision), and took
+1Password's notes on the one drifted pair. 174 entries in the base.
+
+`scripts/e2e-1password.sh` runs the table end to end: mirror, idempotent
+quiet pass (one `op item list`, zero fetches), edit each way, keyring-born
+create with stamp, remote-born mirror, keyring delete → Archive, Archive →
+keyring delete, both conflict directions, modification-beats-deletion
+resurrecting as a new item with a restamp, a simulated mid-apply `op`
+failure that leaves the rest for the next run, and a value-free state
+file. 19 of 19.
+
+What it found, and what was changed for it:
+
+- **`op` prints two timestamp forms.** `item list` gives UTC to the
+  second (`…T16:27:42Z`); `item get` and `item edit` give local time with
+  an offset and nanoseconds (`…T12:27:42.39627885-04:00`). The parser
+  takes both and the base stores the canonical UTC form, or a written
+  entry would never match the list again and be fetched every tick. The
+  base timestamp is also refreshed whenever an in-sync entry's list value
+  differs — the server may stamp a write a second after the reply.
+- **A remote edit needs a moment.** Listing right after `op item edit`
+  can still show the previous `updated_at` (the app pushes
+  asynchronously); in a conflict that flips the winner. Real edits arrive
+  from other devices minutes old; the test waits two seconds.
+- **Two keyring items with one stamp** (a tool that re-creates instead of
+  editing — `secret-tool store` does exactly that, adding its own
+  `xdg:schema` attribute so it never replaces) are resolved to the most
+  recently modified one.
+- **`op item get` resolves archived ids**, so "still live" is a question
+  for the list, not `get`.
+
+Open question 4 (a locked app) is still open; the daemon's back-off is
+what happens in the meantime. Question 5 (the "top level process" the app
+looks for) is unneeded now.

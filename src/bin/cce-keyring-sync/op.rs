@@ -35,8 +35,11 @@ pub struct RemoteEntry {
     pub notes: String,
     /// Server-side modification time, unix seconds (0 when unparseable).
     pub updated: i64,
-    /// The interchange's own timestamp text, verbatim, so a base snapshot
-    /// compares without re-parsing (1Password: RFC 3339 `updated_at`).
+    /// `updated` as canonical RFC 3339 UTC text (`2026-09-21T16:27:42Z`),
+    /// the form the base snapshot stores. Canonical because `op` itself is
+    /// not consistent: `item list` prints UTC to the second, `item get` and
+    /// `item edit` print local time with an offset and nanoseconds, and a
+    /// base written from one must still match a list read from the other.
     pub updated_raw: String,
 }
 
@@ -54,24 +57,23 @@ pub struct RemoteSummary {
 }
 
 /// The cross-machine store the keyring is mirrored against.
-#[allow(dead_code)] // create/update/recycle are phase 2's callers
 pub trait Interchange {
-    fn name(&self) -> &'static str;
     /// Every login the store holds — no secrets.
     async fn list(&mut self) -> Result<Vec<RemoteSummary>, String>;
     /// One entry in full.
     async fn fetch(&mut self, id: &str) -> Result<RemoteEntry, String>;
-    /// Store a new entry; returns its id. `e.id` is ignored.
-    async fn create(&mut self, e: &RemoteEntry) -> Result<String, String>;
-    /// Overwrite an existing entry's synced fields, leaving the rest alone.
-    async fn update(&mut self, e: &RemoteEntry) -> Result<(), String>;
+    /// Store a new entry; returns its id and its timestamp text. `e.id` is ignored.
+    async fn create(&mut self, e: &RemoteEntry) -> Result<(String, String), String>;
+    /// Overwrite an existing entry's synced fields, leaving the rest alone;
+    /// returns the entry's new timestamp text, so the base can record it
+    /// without another fetch.
+    async fn update(&mut self, e: &RemoteEntry) -> Result<String, String>;
     /// Soft-delete: 1Password's Archive, the kdbx's Recycle Bin.
     async fn recycle(&mut self, id: &str) -> Result<(), String>;
 }
 
 /// True when the error text is the app's dialog timing out — a refusal to
-/// back off from, not a fault to log as one. Phase 2's daemon is the caller.
-#[allow(dead_code)]
+/// back off from, not a fault to log as one.
 pub fn is_dismissed(err: &str) -> bool {
     err.contains(DISMISSED)
 }
@@ -134,10 +136,6 @@ impl OnePassword {
 }
 
 impl Interchange for OnePassword {
-    fn name(&self) -> &'static str {
-        "onepassword"
-    }
-
     async fn list(&mut self) -> Result<Vec<RemoteSummary>, String> {
         let mut args = vec!["item", "list", "--categories", "Login"];
         if !self.vault.is_empty() {
@@ -153,7 +151,7 @@ impl Interchange for OnePassword {
         Ok(entry_from_json(&v))
     }
 
-    async fn create(&mut self, e: &RemoteEntry) -> Result<String, String> {
+    async fn create(&mut self, e: &RemoteEntry) -> Result<(String, String), String> {
         if self.vault.is_empty() {
             return Err("no vault configured for new entries (adopt --vault <name>)".into());
         }
@@ -161,19 +159,18 @@ impl Interchange for OnePassword {
         let v = self
             .run_json(&["item", "create", "--vault", self.vault.as_str(), "-"], Some(template))
             .await?;
-        v.get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| "op item create: no id in reply".to_string())
+        let id = v.get("id").and_then(Value::as_str).ok_or("op item create: no id in reply")?;
+        Ok((id.to_string(), updated_of(&v).1))
     }
 
-    async fn update(&mut self, e: &RemoteEntry) -> Result<(), String> {
+    async fn update(&mut self, e: &RemoteEntry) -> Result<String, String> {
         // Round-trip the whole item so sections, custom fields and tags
         // survive; only the synced fields are rewritten.
         let mut v = self.run_json(&["item", "get", &e.id], None).await?;
         apply_entry(&mut v, e);
         let body = serde_json::to_vec(&v).unwrap();
-        self.run_json(&["item", "edit", &e.id], Some(body)).await.map(|_| ())
+        let reply = self.run_json(&["item", "edit", &e.id], Some(body)).await?;
+        Ok(updated_of(&reply).1)
     }
 
     async fn recycle(&mut self, id: &str) -> Result<(), String> {
@@ -210,15 +207,23 @@ fn field_by_purpose<'a>(v: &'a Value, purpose: &str) -> Option<&'a Value> {
         .find(|f| f.get("purpose").and_then(Value::as_str) == Some(purpose))
 }
 
+/// The (unix, canonical text) pair for an item's `updated_at`.
+pub fn updated_of(v: &Value) -> (i64, String) {
+    match parse_rfc3339(&s(v, "updated_at")) {
+        Some(t) => (t, format_rfc3339(t)),
+        None => (0, String::new()),
+    }
+}
+
 pub fn summary_from_json(v: &Value) -> RemoteSummary {
-    let updated_raw = s(v, "updated_at");
+    let (updated, updated_raw) = updated_of(v);
     RemoteSummary {
         id: s(v, "id"),
         vault: v.get("vault").map(|x| s(x, "name")).unwrap_or_default(),
         title: s(v, "title"),
         username: s(v, "additional_information"),
         url: primary_url(v),
-        updated: parse_rfc3339(&updated_raw).unwrap_or(0),
+        updated,
         updated_raw,
     }
 }
@@ -297,25 +302,57 @@ pub fn apply_entry(v: &mut Value, e: &RemoteEntry) {
     set(v, "NOTES", "notesPlain", "STRING", &e.notes);
 }
 
-/// `2026-09-21T15:41:14Z` (optionally with fraction) → unix seconds. Only
-/// the UTC form 1Password emits; anything else is None, and the caller
-/// treats 0 as "unknown", which the skew tolerance already absorbs.
+/// RFC 3339 → unix seconds: `2026-09-21T15:41:14Z`, or with a fraction,
+/// or with a `±HH:MM` offset (what `op item get`/`edit` print). Fractions
+/// are dropped: the list side only has seconds, and the two must agree.
 pub fn parse_rfc3339(t: &str) -> Option<i64> {
-    let t = t.strip_suffix('Z')?;
-    let (date, time) = t.split_once('T')?;
+    let (date, rest) = t.split_once('T')?;
+    let (time, offset_secs) = if let Some(r) = rest.strip_suffix('Z') {
+        (r, 0)
+    } else {
+        let i = rest.rfind(['+', '-'])?;
+        let (r, off) = rest.split_at(i);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let (oh, om) = off[1..].split_once(':')?;
+        (r, sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60))
+    };
     let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
     let (y, m, day) = (d.next()??, d.next()??, d.next()??);
     let time = time.split('.').next()?;
     let mut c = time.split(':').map(|p| p.parse::<i64>().ok());
     let (h, mi, sec) = (c.next()??, c.next()??, c.next()??);
-    // Howard Hinnant's days-from-civil.
+    Some(days_from_civil(y, m, day) * 86400 + h * 3600 + mi * 60 + sec - offset_secs)
+}
+
+/// unix seconds → `2026-09-21T16:27:42Z`, the canonical base form.
+pub fn format_rfc3339(t: i64) -> String {
+    let days = t.div_euclid(86400);
+    let rem = t.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+// Howard Hinnant's civil-date algorithms.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + day - 1;
+    let doy = (153 * m + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + h * 3600 + mi * 60 + sec)
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -413,12 +450,26 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_parses_1password_timestamps_only() {
+    fn rfc3339_parses_both_forms_op_prints_to_the_same_second() {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_rfc3339("2026-09-21T15:41:14Z"), Some(1790005274));
         assert_eq!(parse_rfc3339("2026-09-21T15:41:14.5Z"), Some(1790005274));
-        assert_eq!(parse_rfc3339("2026-09-21T15:41:14+02:00"), None);
+        // `op item edit` printed this for the item `op item list` showed as 2026-09-21T16:27:42Z.
+        assert_eq!(parse_rfc3339("2026-09-21T12:27:42.39627885-04:00"), parse_rfc3339("2026-09-21T16:27:42Z"));
+        assert_eq!(parse_rfc3339("2026-09-21T18:27:42+02:00"), parse_rfc3339("2026-09-21T16:27:42Z"));
         assert_eq!(parse_rfc3339(""), None);
+        assert_eq!(parse_rfc3339("nope"), None);
+    }
+
+    #[test]
+    fn the_canonical_form_round_trips() {
+        for t in [0i64, 951782400, 1790005274, 1790008062, 4102444799] {
+            assert_eq!(parse_rfc3339(&format_rfc3339(t)), Some(t), "{t}");
+        }
+        assert_eq!(format_rfc3339(1790005274), "2026-09-21T15:41:14Z");
+        assert_eq!(format_rfc3339(951782400), "2000-02-29T00:00:00Z");
+        let v: Value = json!({"updated_at": "2026-09-21T12:27:42.39627885-04:00"});
+        assert_eq!(updated_of(&v).1, "2026-09-21T16:27:42Z", "a get/edit reply stores as the list form");
     }
 
     #[test]

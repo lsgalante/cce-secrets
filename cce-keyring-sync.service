@@ -1,11 +1,20 @@
-# Runs one bidirectional pass of cce-keyring-sync (see KEYRING-SYNC.md).
-# Driven by cce-keyring-sync.timer; harmless to start by hand.
+# The resident cce-keyring-sync daemon (see KEYRING-SYNC.md, "Phase 0
+# results"): keeps gnome-keyring and 1Password in step, ticking every five
+# minutes. Resident because the 1Password CLI's authorization is keyed to
+# the calling process's parent and lapses after ~10 idle minutes — a oneshot
+# timer would raise an Authorize dialog on every tick; this process raises
+# one per login. SIGUSR1 syncs now (cce-secrets sends it from its Sync
+# button and after a save).
 [Unit]
-Description=Sync gnome-keyring with the Dropbox kdbx
+Description=Sync gnome-keyring with 1Password (resident)
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
-Type=oneshot
-ExecStart=%h/.local/bin/cce-keyring-sync sync
-# Refusals (conflicted copies, Dropbox settling, another run holding the
-# lock) exit nonzero on purpose; the timer just tries again next tick.
-SuccessExitStatus=0 1
+Type=simple
+ExecStart=%h/.local/bin/cce-keyring-sync daemon
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=graphical-session.target

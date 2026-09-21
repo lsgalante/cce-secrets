@@ -17,7 +17,9 @@
 //!   bridge: label=Title, UserName, URL, Notes, plus kdbx-uuid / kdbx-group.
 
 mod adopt;
+mod daemon;
 mod op;
+mod sync;
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -57,6 +59,10 @@ pub(crate) struct State {
     /// 1Password only: the vault new entries are created in.
     #[serde(default)]
     pub vault: String,
+    /// The last run's one-line outcome ("in sync", "synced: …", "failed: …"),
+    /// for cce-secrets' status line — the daemon has no stdout anyone reads.
+    #[serde(default)]
+    pub last_result: String,
     /// Per entry id: the last-synced snapshot the merge runs against.
     pub entries: HashMap<String, EntryState>,
 }
@@ -199,7 +205,7 @@ pub(crate) async fn keyring_get(
     }
 }
 
-async fn keyring_put(
+pub(crate) async fn keyring_put(
     ss: &SecretService<'_>,
     purpose: &str,
     label: &str,
@@ -256,8 +262,10 @@ async fn main() {
         Some("doctor") => "doctor",
         Some("status") => "status",
         Some("adopt") => "adopt",
+        Some("daemon") => "daemon",
         _ => {
             eprintln!("usage: cce-keyring-sync sync   [--dry-run] [--kdbx <path>]");
+            eprintln!("       cce-keyring-sync daemon                              (resident; 1Password backend)");
             eprintln!("       cce-keyring-sync import [--dry-run] [--kdbx <path>]");
             eprintln!("       cce-keyring-sync doctor [--kdbx <path>]");
             eprintln!("       cce-keyring-sync adopt  [--dry-run] [--vault <name>]   (pair the keyring with 1Password)");
@@ -286,6 +294,9 @@ async fn main() {
             println!("kdbx:      {}", kdbx.display());
         }
         println!("state:     {} entries, last run {}", state.entries.len(), state.last_run);
+        if !state.last_result.is_empty() {
+            println!("last:      {}", state.last_result);
+        }
         if !onepassword {
             for c in conflicted_copies(&kdbx) {
                 println!("CONFLICT:  {}", c.display());
@@ -297,11 +308,25 @@ async fn main() {
         adopt::adopt(&state_path, state, vault_flag.as_deref().unwrap_or(""), dry_run).await;
         return;
     }
+    if cmd == "daemon" {
+        daemon::daemon(&state_path).await;
+        return;
+    }
     if onepassword {
+        if cmd == "sync" {
+            // A one-shot pass (its own Authorize dialog); the daemon is the
+            // usual caller, and the flock keeps the two apart.
+            let mut remote = op::OnePassword::new(&state.vault);
+            let mut state = state;
+            if let Err(e) = sync::sync_remote(&mut remote, &state_path, &mut state, dry_run).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         // The kdbx paths key their base by kdbx UUID; running one against a
         // 1Password base would re-plan every entry from nothing.
         eprintln!("the sync base belongs to the 1Password backend; `{cmd}` is kdbx-only");
-        eprintln!("(phase 2's daemon is not built yet — see KEYRING-SYNC.md)");
         std::process::exit(1);
     }
 
@@ -566,7 +591,7 @@ const SKEW_TOLERANCE_SECS: i64 = 3;
 /// A crude cross-process lock: sync and import must not interleave with a
 /// timer run. Advisory flock on a file in the state dir (local, never in
 /// Dropbox — Dropbox syncing lock files is its own disaster).
-fn take_lock() -> Option<std::fs::File> {
+pub(crate) fn take_lock() -> Option<std::fs::File> {
     let _ = std::fs::create_dir_all(state_dir());
     let f = std::fs::OpenOptions::new()
         .create(true)

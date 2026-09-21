@@ -92,11 +92,71 @@ enum Mode {
     Edit { path: Option<String> },
 }
 
-/// One pass of the external sync tool. Success reports its own summary line
-/// ("synced: … " or "in sync"); refusals — conflicted copies, Dropbox
-/// settling, the flock — arrive as the error text, which is exactly the
-/// guidance the user needs ("run doctor").
+/// cce-keyring-sync's state file: `last_run` (unix seconds) and the last
+/// run's one-line outcome. The daemon's only channel back to this UI.
+fn sync_state_path() -> std::path::PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+        })
+        .join("cce/keyring-sync/state.json")
+}
+
+fn read_sync_state() -> Option<(i64, String)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sync_state_path()).ok()?).ok()?;
+    let last_run = v.get("last_run")?.as_i64()?;
+    let last_result = v.get("last_result").and_then(|r| r.as_str()).unwrap_or("").to_string();
+    Some((last_run, last_result))
+}
+
+/// Ask the resident daemon for a pass now. Its `op` authorization is the
+/// live one (KEYRING-SYNC.md, phase 0), so this raises no dialog; a
+/// one-shot `cce-keyring-sync sync` from here would. Fire-and-forget: a
+/// save does not wait for the mirror. False when no daemon is running.
+async fn poke_sync_daemon() -> bool {
+    let active = tokio::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "cce-keyring-sync.service"])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+    tokio::process::Command::new("systemctl")
+        .args(["--user", "kill", "-s", "SIGUSR1", "cce-keyring-sync.service"])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The Sync button. With the daemon up: poke it and wait for its state
+/// file to record a new run, then show that run's outcome. Without it: the
+/// one-shot binary, whose summary line ("synced: …", "in sync") or
+/// refusal text is the status.
 async fn run_sync(tx: &calloop::channel::Sender<AppMessage>) {
+    let before = read_sync_state().map(|(t, _)| t).unwrap_or(0);
+    if poke_sync_daemon().await {
+        // A pass is one `op item list` plus writes; a dialog nobody
+        // answers holds it 60 s. Wait a little past that.
+        for _ in 0..180 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some((t, result)) = read_sync_state() {
+                if t > before {
+                    let is_error = result.starts_with("failed");
+                    let msg = if result.is_empty() { "synced".to_string() } else { result };
+                    let _ = tx.send(AppMessage::Status(msg, is_error));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(AppMessage::Status("sync daemon did not report within 90s".to_string(), true));
+        return;
+    }
     let out = tokio::process::Command::new("cce-keyring-sync")
         .arg("sync")
         .output()
@@ -163,7 +223,13 @@ fn spawn_worker(rx: std::sync::mpsc::Receiver<Cmd>, tx: calloop::channel::Sender
                         load_entries(&ss, &tx).await;
                     }
                     op => {
+                        let edits = matches!(op, Cmd::CreateItem { .. } | Cmd::UpdateItem { .. } | Cmd::DeleteItem { .. });
                         let Err(first) = run_secret_op(&ss, &tx, op.clone()).await else {
+                            if edits {
+                                // A saved entry reaches 1Password on the
+                                // daemon's next pass; ask for it now.
+                                poke_sync_daemon().await;
+                            }
                             continue;
                         };
                         // The daemon may have restarted underneath us
@@ -572,24 +638,14 @@ impl SecretsApp {
     }
 
     /// "synced 4m ago" from cce-keyring-sync's state file, refreshed at most
-    /// every 5s — the timer runs every 15 minutes, so staleness is invisible.
+    /// every 5s — the daemon ticks every 5 minutes, so staleness is invisible.
     fn refresh_sync_hint(&mut self) {
         if self.sync_hint_at.is_some_and(|t| t.elapsed().as_secs() < 5) {
             return;
         }
         self.sync_hint_at = Some(std::time::Instant::now());
-        let path = std::env::var("XDG_STATE_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
-            })
-            .join("cce/keyring-sync/state.json");
-        self.sync_hint = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("last_run").and_then(|n| n.as_i64()))
+        self.sync_hint = read_sync_state()
+            .map(|(t, _)| t)
             .filter(|&t| t > 0)
             .map(|t| {
                 let ago = (std::time::SystemTime::now()
