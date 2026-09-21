@@ -71,6 +71,9 @@ enum Cmd {
 enum AppMessage {
     Loaded(Vec<EntryData>),
     Status(String, bool),
+    /// A transient progress line ("Loading entries…"): shown unless a sync
+    /// is in flight, and never the end of one.
+    Progress(String),
     Revealed { path: String, secret: String },
     SelectPath(String),
     RefreshClicked,
@@ -283,7 +286,7 @@ async fn run_secret_op(
 }
 
 async fn load_entries(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppMessage>) {
-    let _ = tx.send(AppMessage::Status("Loading entries…".to_string(), false));
+    let _ = tx.send(AppMessage::Progress("Loading entries…".to_string()));
     let collections = match ss.get_all_collections().await {
         Ok(c) => c,
         Err(e) => {
@@ -804,6 +807,12 @@ impl Application for SecretsApp {
                 self.syncing = false;
                 self.status_msg = msg;
                 self.status_is_error = is_error;
+            }
+            AppMessage::Progress(msg) => {
+                if !self.syncing {
+                    self.status_msg = msg;
+                    self.status_is_error = false;
+                }
             }
             AppMessage::Revealed { path, secret } => {
                 if self.selected.as_deref() == Some(path.as_str()) {
