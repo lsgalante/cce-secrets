@@ -173,8 +173,9 @@ that is irrelevant, and there is no resident unlock to keep warm.
 
 # Scoping: 1Password as the interchange (option 1, 2026-09-21)
 
-Status: **scoped, nothing built.** Neither the 1Password app nor `op` is
-installed on this machine yet.
+Status: **phase 0 measured (2026-09-21), nothing built.** App and `op`
+installed, integrated, signed in. The oneshot timer does not survive the
+measurements; see "Phase 0 results" at the end.
 
 ## Goal
 
@@ -342,7 +343,7 @@ it:
   the app's socket; the user unit already has both (it reaches gnome-keyring
   the same way).
 
-## The open problem: authorization from a timer
+## The open problem: authorization from a timer (superseded — see phase 0 results below)
 
 This is the one thing that decides whether the timer survives, and it is
 **not documented**: how often `op` re-prompts under desktop-app integration.
@@ -382,10 +383,10 @@ unacceptable however native the window is. Measure it before anything else
 
 ## Phases
 
-0. **Measure.** Install, integrate, run `op item list` from a terminal and
+0. **Measure.** ~~Install, integrate, run `op item list` from a terminal and
    from a `systemd-run --user` unit; time how long the authorization lasts
-   and whether the prompt appears in `cce-authenticator`. Half a day; settles
-   the timer question and risk 3.
+   and whether the prompt appears in `cce-authenticator`.~~ **Done 2026-09-21,
+   results below.** The timer is dead; the daemon replaces it.
 1. **`Interchange` trait + `OnePassword` backend + `adopt --dry-run`.** The
    kdbx backend moves behind the trait unchanged; `cargo test` on the
    pairing logic against a fixture list. `adopt` for real once the dry run
@@ -409,3 +410,105 @@ unacceptable however native the window is. Measure it before anything else
 3. Does the CSV round trip carry TOTP seeds, and should
    `cce-authenticator` then read them from 1Password directly (its own
    decision, as before)?
+
+## Phase 0 results (2026-09-21)
+
+Measured with `op` 2.39.0 against 1Password for Linux 8.12.36, CLI
+integration on, system authentication on, app unlocked throughout.
+Everything below comes from timed calls plus the app's own log
+(`~/.config/1Password/logs/1Password_r00000.log`, UTC).
+
+**The integration works, and the JSON is as scoped.** `op item list --format
+json` carries `id`, `title`, `updated_at`, `urls[{href,primary}]`, `vault`
+and `additional_information` (the username), and no secrets. `op vault
+list` shows the one vault, `Personal`.
+
+**Authorization is the app's own "Authorize" dialog, not polkit.** Across
+some twenty authorizations neither polkitd nor `cce-authenticator` logged
+a line. The "system authentication" setting only governs unlocking the
+app; risk 3 above is void. An unanswered dialog times out after **60 s**
+and `op` exits 1 with `authorization prompt dismissed, please try again`.
+
+**Authorization is keyed to the caller's parent process, nothing else.**
+The app log says it on every request: `no top level process found,
+falling back to the caller process`. The consequences, each measured:
+
+| shape | result |
+| --- | --- |
+| second `op` call under the same parent, 5–20 s later | passes, no dialog |
+| new parent 30 s later (a second oneshot unit) | new dialog |
+| `setsid` under the same shell | refused (new parent) |
+| scrubbed environment, same parent | passes — the environment is irrelevant |
+| `op` as a unit's main process (parent = `systemd --user`) | app aborts with `executable path is missing for caller process`; `op` hangs the full 60 s |
+| `op` under a shell inside the unit | works like anywhere else |
+| private `--config` dir | still routes through the app; no escape into the non-integrated mode |
+
+So **a oneshot timer run is one dialog per tick**, full stop, and the
+timer design above cannot ship.
+
+**The authorization is idle-limited and use extends it.** Under one
+long-lived parent: calls 3 minutes apart passed for 12 minutes with no
+dialog; a 12-minute gap then produced a fresh dialog. A second run with
+calls 5 minutes apart passed for 25 minutes after the click, to the end of the run. That is the
+SDK's documented rule (ten minutes of inactivity) applied to the CLI, and
+it is the whole design: **a resident parent that calls `op` at least every
+few minutes holds its authorization for as long as it lives.**
+
+### What changes in the shape
+
+`cce-keyring-sync` becomes resident under the 1Password backend, as
+`cce-keyring-sync daemon`, a systemd user service (`WantedBy=
+graphical-session.target`, like the polkit agent), replacing the timer.
+The objection to a resident process above was a daemon holding the
+Dropbox kdbx open all day; there is no file any more, so it lapses.
+
+- **Tick every 5 minutes.** That is inside the idle window with margin, so
+  the tick doubles as the keepalive; a quiet tick is one `op item list`,
+  no secrets, a few hundred bytes.
+- **One dialog per login session** at the first tick, plus one after any
+  gap the tick could not cover — suspend, the app locking (autolock is 60
+  minutes here; an `op` call against a locked app is **untested**, open
+  question 4), or the app restarting.
+- **Back off after a dismissed dialog.** A dialog nobody answers costs a
+  60-second hang, and re-offering one every five minutes to an empty chair
+  is exactly the annoyance the timer design was rejected for. After
+  `authorization prompt dismissed`, the daemon waits for a trigger before
+  trying again: the cce-secrets Sync button, a save in cce-secrets, or the
+  seat coming back from idle (`loginctl show-session -p IdleHint`). Every
+  `op` call runs under a 75-second timeout so a wedged app cannot hang a
+  tick.
+- **Spawn `op` as a direct child, always**, never via `setsid`,
+  `systemd-run`, or a double fork: the authorization is the daemon's pid.
+- **cce-secrets pokes the daemon** instead of running the binary: the Sync
+  button sends `SIGUSR1` to the unit's main pid (or a line over the usual
+  `cce_ui::ipc` socket, if the status line wants a reply). The state file
+  and its "synced Nm ago" hint stay as they are. Running `cce-keyring-sync
+  sync` by hand still works and prompts its own dialog; the flock keeps
+  it from interleaving with the daemon.
+
+The "open problem" section above is answered: the timer cadence question
+does not arise, and the seat-idle check moves from "when to prompt" to
+"when to retry after a dismissed prompt". The service-account fallback
+stays on the shelf.
+
+### Fallback, parked
+
+`op` without the app integration signs in with the account password and
+Secret Key, prints a 30-minute session token, and can take the password
+on stdin — the same trust posture as the kdbx master password stored in
+the keyring today, and no dialogs ever. It needs the integration toggle
+off (a private `--config` dir does not escape it, measured) and a manual
+`op account add`, which needs the Secret Key and password typed by the
+person. Worth knowing if the resident design misbehaves; not preferred,
+because it moves the account password into the keyring and gives up the
+app's approval entirely.
+
+### Open questions, continued
+
+4. What does an `op` call do against a *locked* app — a system-auth
+   (polkit → cce-authenticator) unlock prompt, the Authorize dialog, or a
+   plain refusal? Decides what the daemon sees after autolock.
+5. What does the app count as a "top level process"? If the daemon could
+   present as one, the authorization might be remembered across restarts
+   the way it is for a terminal window. Not needed for the design; nice
+   if cheap.
