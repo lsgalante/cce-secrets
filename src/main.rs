@@ -7,9 +7,9 @@ use cce_ui::widget::{
     ScrollMotion, TextBox, WidgetHost, LINE_PX,
 };
 
-const PAD: f32 = 16.0; // TODO(style): root_plate_inset() / root_plate_gap()
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
+const SEARCH_H: f32 = 30.0;
 const STATUS_H: f32 = 30.0;
 const BTN_W: f32 = 90.0;
 const BTN_H: f32 = 28.0;
@@ -750,7 +750,8 @@ impl Application for SecretsApp {
             pending_delete: None,
             scroll_y: 0.0,
             scroll_motion: ScrollMotion::new(),
-            list_rect: (PAD, PAD + 38.0, LIST_W, 0.0),
+            // Placed by the first frame; empty until then so nothing hit-tests.
+            list_rect: (0.0, 0.0, 0.0, 0.0),
             pointer: (0.0, 0.0),
             hover_row: None,
             status_msg: "Connecting to Secret Service…".to_string(),
@@ -937,19 +938,28 @@ impl Application for SecretsApp {
         // material at its opacity, the shared silhouette arc, the rolled rim.
         pc.root_plate(sw, sh);
 
-        // ── Left panel: search + entry list ──
-        self.search_box.set_rect(PAD, PAD, LIST_W, 30.0);
-        self.refresh_btn.set_rect(sw - PAD - BTN_W, PAD, BTN_W, BTN_H);
-        self.new_btn.set_rect(sw - PAD - BTN_W * 2.0 - 10.0, PAD, BTN_W, BTN_H);
-        self.sync_btn.set_rect(sw - PAD - BTN_W * 3.0 - 20.0, PAD, BTN_W, BTN_H);
+        // Spacing is the ladder (cce-ui/CLAUDE.md): the window edge is
+        // `inset`, siblings on the root plate stand `gap` apart, and inside
+        // the two panes content sits `pad` off the rim with `pgap` between
+        // blocks. The literals that remain are sizes and text line advances.
+        let inset = cce_ui::layout::root_plate_inset();
+        let gap = cce_ui::layout::root_plate_gap();
+        let pad = cce_ui::layout::plate_padding();
+        let pgap = cce_ui::layout::plate_gap();
 
-        let list_y = PAD + 38.0;
-        let list_h = (sh - list_y - STATUS_H - 8.0).max(0.0);
-        self.list_rect = (PAD, list_y, LIST_W, list_h);
-        quad(&mut pc, PAD, list_y, LIST_W, list_h, cce_ui::color::list_bg_color());
+        // ── Left panel: search + entry list ──
+        self.search_box.set_rect(inset, inset, LIST_W, SEARCH_H);
+        self.refresh_btn.set_rect(sw - inset - BTN_W, inset, BTN_W, BTN_H);
+        self.new_btn.set_rect(sw - inset - BTN_W * 2.0 - gap, inset, BTN_W, BTN_H);
+        self.sync_btn.set_rect(sw - inset - BTN_W * 3.0 - 2.0 * gap, inset, BTN_W, BTN_H);
+
+        let list_y = inset + SEARCH_H + gap;
+        let list_h = (sh - list_y - STATUS_H - gap).max(0.0);
+        self.list_rect = (inset, list_y, LIST_W, list_h);
+        quad(&mut pc, inset, list_y, LIST_W, list_h, cce_ui::color::list_bg_color());
 
         let filtered = self.filtered();
-        let list_bounds = Some([PAD, list_y, PAD + LIST_W, list_y + list_h]);
+        let list_bounds = Some([inset, list_y, inset + LIST_W, list_y + list_h]);
         for (row, &ei) in filtered.iter().enumerate() {
             let ry = list_y + row as f32 * ROW_H - self.scroll_y;
             if ry + ROW_H < list_y || ry > list_y + list_h {
@@ -958,13 +968,15 @@ impl Application for SecretsApp {
             let entry = &self.entries[ei];
             let is_selected = self.selected.as_deref() == Some(entry.path.as_str());
             if is_selected {
-                quad(&mut pc, PAD, ry, LIST_W, ROW_H, [0.10, 0.28, 0.17, 1.0]);
+                quad(&mut pc, inset, ry, LIST_W, ROW_H, [0.10, 0.28, 0.17, 1.0]);
             } else if self.hover_row == Some(row) {
-                quad(&mut pc, PAD, ry, LIST_W, ROW_H, [1.0, 1.0, 1.0, 0.04]);
+                quad(&mut pc, inset, ry, LIST_W, ROW_H, [1.0, 1.0, 1.0, 0.04]);
             }
+            // TODO(style): the two text lines sit at fixed offsets inside the
+            // ROW_H row — a line rhythm, not a rung.
             pc.text_with(
                 entry.label.clone(),
-                PAD + 12.0,
+                inset + pad,
                 ry + 8.0,
                 12.0,
                 srgb_u8(cce_ui::colors::TEXT_HEADER),
@@ -974,7 +986,7 @@ impl Application for SecretsApp {
             if let Some(hint) = entry.hint() {
                 pc.text_with(
                     hint.to_string(),
-                    PAD + 12.0,
+                    inset + pad,
                     ry + 25.0,
                     10.0,
                     srgb_u8(cce_ui::colors::TEXT_DIM),
@@ -988,7 +1000,9 @@ impl Application for SecretsApp {
         let content_h = filtered.len() as f32 * ROW_H;
         if content_h > list_h {
             let sb_w = 4.0;
-            let sb_x = PAD + LIST_W - sb_w - 3.0;
+            // style: deliberate — the 4px thumb hugs the list's rim; a rung-wide
+            // gutter would read as a column of its own.
+            let sb_x = inset + LIST_W - sb_w - 3.0;
             let visible_ratio = list_h / content_h;
             let thumb_h = (list_h * visible_ratio).clamp(20.0, list_h);
             let scroll_ratio = if self.max_scroll() > 0.0 { self.scroll_y / self.max_scroll() } else { 0.0 };
@@ -998,23 +1012,29 @@ impl Application for SecretsApp {
         }
 
         // ── Right panel: detail view or the entry form ──
-        let dx = PAD + LIST_W + 20.0;
-        let dw = (sw - dx - PAD).max(0.0);
+        let dx = inset + LIST_W + gap;
+        let dw = (sw - dx - inset).max(0.0);
         let detail_bounds = Some([dx, list_y, dx + dw, list_y + list_h]);
+        // The pane's content starts one plate padding below its top; the
+        // 22.0 under the 15px header is that line's advance, not a rung.
+        let hy = list_y + pad;
         match &self.mode {
             Mode::Edit { path } => {
                 let header = if path.is_some() { "Edit entry" } else { "New entry" };
-                pc.text_with(header.to_string(), dx, list_y + 4.0, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
+                pc.text_with(header.to_string(), dx, hy, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
                 let labels = ["Title", "UserName", "URL", "Notes", "Password"];
-                let mut fy = list_y + 36.0;
-                let box_w = (dw - 4.0).min(320.0);
+                let mut fy = hy + 22.0 + pgap;
+                let box_w = (dw - 4.0).min(320.0); // TODO(style): 4px slack on the field width, not a rung
+                // Each field is a 10px label strip (14.0) over a 28px box. The
+                // fields are `pgap` apart rather than `control_gap()`: five
+                // control-height gaps overrun the default window height.
                 for (label, tb) in labels.iter().zip(self.form_boxes_mut()) {
                     tb.set_rect(dx, fy + 14.0, box_w, 28.0);
                     pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, None);
-                    fy += 52.0;
+                    fy += 14.0 + 28.0 + pgap;
                 }
-                self.save_btn.set_rect(dx, fy + 4.0, BTN_W, BTN_H);
-                self.cancel_btn.set_rect(dx + BTN_W + 10.0, fy + 4.0, BTN_W, BTN_H);
+                self.save_btn.set_rect(dx, fy, BTN_W, BTN_H);
+                self.cancel_btn.set_rect(dx + BTN_W + pgap, fy, BTN_W, BTN_H);
                 for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.edit_btn, &mut self.delete_btn, &mut self.new_btn] {
                     park(b);
                 }
@@ -1026,17 +1046,19 @@ impl Application for SecretsApp {
                     tb.set_rect(-1000.0, -1000.0, 10.0, 10.0);
                 }
                 if let Some(entry) = self.selected_entry().cloned() {
-                    pc.text_with(entry.label.clone(), dx, list_y + 4.0, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
-                    pc.text_with(entry.collection.clone(), dx, list_y + 26.0, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                    pc.text_with(entry.label.clone(), dx, hy, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
+                    pc.text_with(entry.collection.clone(), dx, hy + 22.0, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
 
-                    let mut ay = list_y + 56.0;
+                    // The header block (a 15px line, a 10px line), a pane gap,
+                    // then the attribute rows at their 22.0 line advance.
+                    let mut ay = hy + 22.0 + 14.0 + pgap;
                     for (key, value) in &entry.attrs {
                         pc.text_with(key.clone(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
                         pc.text_with(value.clone(), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
                         ay += 22.0;
                     }
 
-                    ay += 8.0;
+                    ay += pgap;
                     pc.text_with("secret".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
                     let (secret_text, revealed) = match self.revealed_secret() {
                         Some(s) => (s.to_string(), true),
@@ -1048,13 +1070,15 @@ impl Application for SecretsApp {
                     self.delete_btn.set_label(
                         if self.pending_delete.as_deref() == Some(entry.path.as_str()) { "Confirm" } else { "Delete" },
                     );
-                    self.reveal_btn.set_rect(dx, ay + 28.0, BTN_W, BTN_H);
-                    self.copy_btn.set_rect(dx + BTN_W + 10.0, ay + 28.0, BTN_W, BTN_H);
-                    self.edit_btn.set_rect(dx, ay + 28.0 + BTN_H + 8.0, BTN_W, BTN_H);
-                    self.delete_btn.set_rect(dx + BTN_W + 10.0, ay + 28.0 + BTN_H + 8.0, BTN_W, BTN_H);
+                    // Two button rows under the secret line (14.0, its advance).
+                    let by = ay + 14.0 + pgap;
+                    self.reveal_btn.set_rect(dx, by, BTN_W, BTN_H);
+                    self.copy_btn.set_rect(dx + BTN_W + pgap, by, BTN_W, BTN_H);
+                    self.edit_btn.set_rect(dx, by + BTN_H + pgap, BTN_W, BTN_H);
+                    self.delete_btn.set_rect(dx + BTN_W + pgap, by + BTN_H + pgap, BTN_W, BTN_H);
                 } else {
                     let hint = if self.entries.is_empty() { "" } else { "Select an entry" };
-                    pc.text_with(hint.to_string(), dx, list_y + 4.0, 11.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                    pc.text_with(hint.to_string(), dx, hy, 11.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
                     for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.edit_btn, &mut self.delete_btn] {
                         park(b);
                     }
@@ -1077,24 +1101,24 @@ impl Application for SecretsApp {
         let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::colors::TEXT_DIM) };
         pc.text_with(
             self.status_msg.clone(),
-            PAD,
-            sh - STATUS_H + 6.0,
+            inset,
+            sh - STATUS_H + 6.0, // TODO(style): seats the 10px line in the STATUS_H band, not a rung
             10.0,
             status_color,
             None,
-            Some([PAD, sh - STATUS_H, sw - PAD, sh]),
+            Some([inset, sh - STATUS_H, sw - inset, sh]),
         );
         self.refresh_sync_hint();
         if !self.sync_hint.is_empty() {
             let w = cce_ui::widget::display::measure_text_width(&self.sync_hint, &cce_ui::layout::read_preferred_fonts().0, 10.0);
             pc.text_with(
                 self.sync_hint.clone(),
-                sw - PAD - w,
+                sw - inset - w,
                 sh - STATUS_H + 6.0,
                 10.0,
                 srgb_u8(cce_ui::colors::TEXT_DIM),
                 None,
-                Some([PAD, sh - STATUS_H, sw - PAD, sh]),
+                Some([inset, sh - STATUS_H, sw - inset, sh]),
             );
         }
 
