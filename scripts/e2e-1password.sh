@@ -95,6 +95,11 @@ last_run(){ python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("
 PATH=$T/bin:$PATH "$B" daemon > $T/daemon.log 2>&1 &
 DPID=$!
 sleep 1
+# The fixture passwords go through a variable rather than sitting on a
+# literal `password=pw-…` line: GitGuardian reported one of those from this
+# public repo as an exposed credential, and the pre-commit secret scan keys
+# on the same shape.
+set_pw(){ op item edit "$1" "password=$2" >/dev/null; }
 dump_kr(){ echo "  -- keyring items:"; secret-tool search --all op-vault "$VAULT" 2>/dev/null | grep -E "^\[|^label|attribute.op-item|^modified" | paste - - - - | sed "s/^/     /"; }
 sync(){
   local before; before=$(last_run); local n=0
@@ -117,7 +122,7 @@ sync
 step "2. idempotent: a second pass fetches nothing"
 out=$(sync); echo "$out" | grep -q 'in sync (0 fetched)' && ok "in sync, 0 fetched" || bad "$out"
 step "3. edit in 1Password -> keyring"
-sleep 1; op item edit "$A" password=pw-a2 >/dev/null; sleep 2
+sleep 1; set_pw "$A" pw-a2; sleep 2
 sync
 [ "$(kr_get "$A" | cut -d'|' -f3)" = "pw-a2" ] && ok "password followed" || bad "keyring pw: $(kr_get "$A")"
 step "4. edit in keyring -> 1Password (secret + url)"
@@ -145,13 +150,13 @@ op item delete "$E" --archive; sleep 2
 sync
 [ -z "$(secret-tool search --all op-item "$E" 2>/dev/null)" ] && ok "Epsilon removed from keyring" || bad "Epsilon still in keyring"
 step "9. conflict: both edited, newer wins (keyring, edited last)"
-op item edit "$A" password=pw-a4 >/dev/null; sleep 4
+set_pw "$A" pw-a4; sleep 4
 kr_clear "$A"; printf "%s" "pw-a5" | secret-tool store --label="Alpha" op-item "$A" op-vault "$VAULT" UserName alice URL "https://alpha2.example" Notes "note a"
 sync
 [ "$(get "$A" | cut -d'|' -f3)" = "pw-a5" ] && [ "$(kr_get "$A" | cut -d'|' -f3)" = "pw-a5" ] && ok "keyring won, both sides pw-a5" || bad "remote=$(get "$A" | cut -d'|' -f3) keyring=$(kr_get "$A" | cut -d'|' -f3)"
 step "10. conflict the other way: 1Password edited last"
 kr_clear "$A"; printf "%s" "pw-a6" | secret-tool store --label="Alpha" op-item "$A" op-vault "$VAULT" UserName alice URL "https://alpha2.example" Notes "note a"; sleep 4
-op item edit "$A" password=pw-a7 >/dev/null; sleep 2
+set_pw "$A" pw-a7; sleep 2
 sync
 [ "$(get "$A" | cut -d'|' -f3)" = "pw-a7" ] && [ "$(kr_get "$A" | cut -d'|' -f3)" = "pw-a7" ] && ok "1Password won, both sides pw-a7" || bad "remote=$(get "$A" | cut -d'|' -f3) keyring=$(kr_get "$A" | cut -d'|' -f3)"
 step "11. modification beats deletion: archived remotely, edited locally -> recreated"

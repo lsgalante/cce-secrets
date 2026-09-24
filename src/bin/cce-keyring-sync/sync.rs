@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn the_account_item_is_excluded() {
-        assert!(excluded_title("1Password Account (lsgalante)"));
+        assert!(excluded_title("1Password Account (alice)"));
         assert!(!excluded_title("Account at 1Password"));
     }
 }

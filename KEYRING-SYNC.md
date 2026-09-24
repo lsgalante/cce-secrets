@@ -26,7 +26,7 @@ cross-machine sync. Concretely:
 - **gnome-keyring stays the live store** on this machine — it already owns
   `org.freedesktop.secrets`, is PAM-unlocked at login, and is what cce-secrets
   fronts today.
-- **The Dropbox kdbx stays the interchange**: `~/Dropbox/Codes/Passwords.kdbx`,
+- **The Dropbox kdbx stays the interchange**: a `.kdbx` in the Dropbox folder,
   usable from other machines and phones with ordinary KeePass apps, unchanged.
 - **`cce-keyring-sync`** is a small non-resident tool that merges the two.
 - **KeePassXC retires on this machine only.** Elsewhere it keeps working against
@@ -531,7 +531,7 @@ freshly imported vault:
 | keyring logins | 171 |
 | 1Password logins after cleanup | 172 |
 | paired and stamped | **168** |
-| 1Password only | 4: 1Password's own account item, `secure.bankofamerica.com` (was in the kdbx Recycle Bin — the CSV export carries the bin), and two test entries |
+| 1Password only | 4: 1Password's own account item, one login that was in the kdbx Recycle Bin (the CSV export carries the bin), and two test entries |
 | keyring only | 3: two `…@cce-mail:default` items cce-mail writes with a `UserName` attribute, and one test entry |
 | field drift on a pair | 1 (notes) — base timestamp left unknown so the first sync takes 1Password's value |
 
