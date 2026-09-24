@@ -7,7 +7,7 @@ use cce_ui::widget::{
     ScrollMotion, TextBox, WidgetHost, LINE_PX,
 };
 
-const PAD: f32 = 16.0;
+const PAD: f32 = 16.0; // TODO(style): root_plate_inset() / root_plate_gap()
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
 const STATUS_H: f32 = 30.0;
@@ -933,7 +933,9 @@ impl Application for SecretsApp {
             pc.quad(Rect { x, y, width: w, height: h }, c);
         };
 
-        quad(&mut pc, 0.0, 0.0, sw, sh, cce_ui::colors::CONTENT_BG);
+        // The standard root plate (cce-ui PlateSpec::window): the DE root
+        // material at its opacity, the shared silhouette arc, the rolled rim.
+        pc.root_plate(sw, sh);
 
         // ── Left panel: search + entry list ──
         self.search_box.set_rect(PAD, PAD, LIST_W, 30.0);
