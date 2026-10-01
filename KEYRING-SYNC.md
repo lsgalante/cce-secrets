@@ -513,7 +513,8 @@ app's approval entirely.
 
 ### Open questions, continued
 
-4. What does an `op` call do against a *locked* app — a system-auth
+4. *(Answered 2026-10-01 — see "Question 4 answered" at the end.)*
+   What does an `op` call do against a *locked* app — a system-auth
    (polkit → cce-authenticator) unlock prompt, the Authorize dialog, or a
    plain refusal? Decides what the daemon sees after autolock.
 5. What does the app count as a "top level process"? If the daemon could
@@ -635,4 +636,102 @@ both still front gnome-keyring over the Secret Service, which was the
 point of choosing a mirror.
 
 Still open: question 4, what an `op` call sees against a locked app. The
-daemon's back-off covers the gap until it is measured.
+daemon's back-off covers the gap until it is measured. (Answered
+2026-10-01, below.)
+
+# 1Password's window out of the loop (option A, 2026-10-01)
+
+The question was whether cce programs could replace 1Password's graphical
+frontend. Two shapes were weighed:
+
+- **A — the app stays, headless.** It keeps running (autostart already
+  passes `--silent`, so no main window opens) as what `op` authorizes
+  against and what syncs with 1Password's servers; cce-secrets is the only
+  window anyone browses in. **Chosen.**
+- **B — the app goes.** `op` without the integration signs in on its own
+  (the "Fallback, parked" above): no dialogs ever, but the account password
+  and Secret Key would have to live in the keyring, whose TPM seal has no
+  PCR policy on a disk with no encryption — a stolen laptop would yield
+  the whole account, not just the mirrored logins. It would also drop the
+  Chrome extension's app unlock, the MCP integration and Quick Access.
+  Rejected. Service accounts cannot read personal vaults, so they are no
+  way around it.
+
+What remains of 1Password's own UI under A, and why it cannot be replaced:
+its unlock screen and its Authorize dialog are the app's trust boundary,
+drawn by the app on purpose and not scriptable. The compositor already
+floats, centres and raises the Authorize dialog (cce-compositor bebebc0e,
+bbd73499), so the phase 1 "dialog hidden under the main window" problem is
+gone, and with the main window never opened it could not arise anyway.
+
+## Question 4 answered: an `op` call against a locked app
+
+From the app's log for the 2026-10-01 18:12 login
+(`~/.config/1Password/logs/1Password_rCURRENT.log`, UTC):
+
+- The app **starts locked**, and system unlock is not available until the
+  account password has been typed once after the app starts (`Sys auth
+  status NotReady`; after the password, `Adding system unlock key`). So
+  every login costs one account-password unlock in 1Password's own window.
+  That is 1Password's rule, not something cce can route around.
+- The daemon starts before the app: its first call ends in `cannot connect
+  to 1Password app`. The next, against the locked app, waited and ended in
+  `authorization timeout`; the calls after that ended as `authorization
+  prompt dismissed`. With the old back-off that held the first sync of the
+  session until about an hour after login, half an hour after the app had
+  been unlocked.
+- The app's idle/screen-lock hook fails here (`op-auto-lock: Could not
+  connect to the X server`), so only the 60-minute auto-lock timer locks
+  it.
+
+What changed in the daemon for it: `authorization timeout` counts as an
+unanswered prompt (back off, like a dismissed dialog), and `cannot connect
+to 1Password app` retries every 30 s, up to ten times, before falling back
+to the 5-minute tick, so a login that unlocks the app promptly syncs
+promptly. The cce-secrets Sync button still cuts any back-off short.
+
+## One-time codes in cce-secrets
+
+The keyring mirror carries logins only, so one-time codes were the one
+thing a person still opened 1Password's window for. cce-secrets now shows
+the selected entry's current code with a countdown, plus a **Copy code**
+button (the clipboard clears after 30 s, like a copied password).
+
+The code comes from the **daemon**, not from cce-secrets running `op`
+itself: the daemon already holds the session's authorization, while
+cce-secrets would raise its own Authorize dialog each launch. The daemon
+listens on `$XDG_RUNTIME_DIR/cce/keyring-sync.sock` (0600), one request per
+connection:
+
+```
+otp <item-id>\n  →  otp <code> <seconds left>\n | none\n | err <text>\n
+```
+
+- `op item get <id> --otp` computes the code app-side, so **the seed never
+  enters either process**; only the six digits cross the socket.
+- Only ids in the base snapshot are served (the mirror's own items), and an
+  id must be bare alphanumerics before it reaches `op`'s argv.
+- The trade: any same-user process can now get a current code without a
+  dialog. Such a process could already read every mirrored password from
+  the unlocked keyring, so this extends the mirror's posture to the second
+  factor's codes. It does not extend it to the seeds.
+- Seconds left assume TOTP's usual 30 s period. A code with another period
+  is still right; only its countdown would be off.
+- cce-secrets asks when the selection lands on an entry carrying an
+  `op-item` stamp, again when the code runs out, and never again for an
+  entry the daemon said has none (until the window reopens). Each answer
+  costs one `op` call, about a second.
+
+**No mirrored login carries a code yet.** A scan of all 377 base ids
+through the socket on 2026-10-01 answered `none` for every one, with no
+errors: this account's codes live in a separate authenticator. The feature
+waits for the first item that gets an OTP field in 1Password. Its UI was
+verified in a shadow against a stand-in daemon instead, since a shadow
+shares the live runtime dir and must not bind the real socket:
+`CCE_KEYRING_SYNC_SOCK=<path>` points cce-secrets elsewhere, and a
+twelve-line Python server answering `otp 482913 <30 - now % 30>` stands in.
+Seen: the code row under the secret, the countdown tracking the wall clock,
+exactly one re-ask per expiry, and Copy code ending the first button row.
+(cce-secrets is a Secret Service *client* and owns no bus name, so it is
+safe in a shadow, contrary to `cce-shadow`'s help text. It lists the live
+keyring there, so browse only.)

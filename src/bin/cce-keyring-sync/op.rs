@@ -20,6 +20,14 @@ pub const OP_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// The text `op` prints when the Authorize dialog timed out unanswered.
 const DISMISSED: &str = "authorization prompt dismissed";
+/// What `op` prints when nobody unlocked the app in time: the first call of
+/// a login, against an app that starts locked and wants its account
+/// password before system unlock works (measured 2026-10-01).
+const TIMED_OUT: &str = "authorization timeout";
+/// The app is not running (yet — the daemon starts before it at login).
+const APP_DOWN: &str = "cannot connect to 1Password app";
+/// `op item get --otp` on an item without a one-time password field.
+const NO_OTP: &str = "doesn't contain any OTP-type fields";
 
 /// One remote entry, whole: the six fields the merge hashes plus identity.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -71,10 +79,16 @@ pub trait Interchange {
     async fn recycle(&mut self, id: &str) -> Result<(), String>;
 }
 
-/// True when the error text is the app's dialog timing out — a refusal to
-/// back off from, not a fault to log as one.
+/// True when the error text is a prompt nobody answered — the Authorize
+/// dialog, or the app's own unlock — a refusal to back off from, not a
+/// fault to log as one.
 pub fn is_dismissed(err: &str) -> bool {
-    err.contains(DISMISSED)
+    err.contains(DISMISSED) || err.contains(TIMED_OUT)
+}
+
+/// True when `op` found no app to talk to.
+pub fn is_app_down(err: &str) -> bool {
+    err.contains(APP_DOWN)
 }
 
 // ───────────────────────────── 1Password ─────────────────────────────
@@ -96,9 +110,18 @@ impl OnePassword {
     /// pid as its parent — never via a shell, setsid, or a double fork),
     /// feed `stdin`, and return stdout. Stderr's last line is the error.
     async fn run(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+        self.run_as(args, stdin, true).await
+    }
+
+    /// `run`, with `--format json` optional: `--otp` refuses it.
+    async fn run_as(&self, args: &[&str], stdin: Option<Vec<u8>>, json: bool) -> Result<Vec<u8>, String> {
         use tokio::io::AsyncWriteExt;
         let mut cmd = tokio::process::Command::new("op");
-        cmd.args(args).arg("--format").arg("json").arg("--no-color");
+        cmd.args(args);
+        if json {
+            cmd.arg("--format").arg("json");
+        }
+        cmd.arg("--no-color");
         if !self.account.is_empty() {
             cmd.arg("--account").arg(&self.account);
         }
@@ -131,6 +154,21 @@ impl OnePassword {
     async fn run_json(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Value, String> {
         let bytes = self.run(args, stdin).await?;
         serde_json::from_slice(&bytes).map_err(|e| format!("op {}: unparseable JSON: {e}", args.join(" ")))
+    }
+
+    /// An item's current one-time code; `None` when it has no OTP field.
+    /// `--otp` has op compute the code, so the seed (the field's value,
+    /// which `item get --format json` would print) never enters this
+    /// process. Not part of `Interchange`: the merge never touches OTP.
+    pub async fn otp(&self, id: &str) -> Result<Option<String>, String> {
+        match self.run_as(&["item", "get", id, "--otp"], None, false).await {
+            Ok(out) => match String::from_utf8_lossy(&out).trim() {
+                "" => Err("op item: empty one-time code".into()),
+                code => Ok(Some(code.to_string())),
+            },
+            Err(e) if e.contains(NO_OTP) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -475,5 +513,9 @@ mod tests {
     fn a_dismissed_prompt_is_recognised() {
         assert!(is_dismissed("op item list: authorization prompt dismissed, please try again"));
         assert!(!is_dismissed("op item list: account is not signed in"));
+        // The first call of a login, against the still-locked app.
+        assert!(is_dismissed("op item: authorization timeout"));
+        assert!(is_app_down("op item: connecting to desktop app: cannot connect to 1Password app, make sure it is running"));
+        assert!(!is_app_down("op item: authorization timeout"));
     }
 }

@@ -12,24 +12,39 @@
 //! empty chair is the annoyance the timer design was rejected for, so after a
 //! dismissal the tick backs off (15 → 30 → 60 minutes) until something asks:
 //! `SIGUSR1`, which cce-secrets sends from its Sync button and after a save.
+//! A prompt nobody answered includes the app's own unlock: it starts locked
+//! at login, and until someone types the account password a call ends in
+//! `authorization timeout` (measured 2026-10-01).
+//!
+//! At login this unit also starts before the app, so a call that finds no
+//! app retries every [`APP_DOWN_RETRY`] for a few minutes instead of
+//! waiting out a whole tick.
+//!
+//! The same pid serves one-time codes to cce-secrets (serve.rs): its
+//! authorization is the reason a code needs no dialog.
 
 use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::op::{is_dismissed, OnePassword};
+use crate::op::{is_app_down, is_dismissed, OnePassword};
 use crate::sync::sync_remote;
 use crate::{now_unix, State};
 
 /// Inside the ~10-minute idle window with margin.
 pub const TICK: Duration = Duration::from_secs(5 * 60);
 const BACKOFF: [Duration; 3] = [Duration::from_secs(15 * 60), Duration::from_secs(30 * 60), Duration::from_secs(60 * 60)];
+/// While the app is not up yet; [`APP_DOWN_TRIES`] of these, then ticks.
+const APP_DOWN_RETRY: Duration = Duration::from_secs(30);
+const APP_DOWN_TRIES: usize = 10;
 
 pub async fn daemon(state_path: &std::path::Path) {
     let mut usr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 handler");
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
     let mut dismissed = 0usize;
+    let mut app_down = 0usize;
     println!("cce-keyring-sync daemon: tick every {}s, SIGUSR1 syncs now", TICK.as_secs());
+    tokio::spawn(crate::serve::serve(state_path.to_path_buf()));
 
     loop {
         // Re-read every tick: adopt or a manual sync may have moved the base.
@@ -45,7 +60,13 @@ pub async fn daemon(state_path: &std::path::Path) {
             match sync_remote(&mut remote, state_path, &mut state, false).await {
                 Ok(_) => {
                     dismissed = 0;
+                    app_down = 0;
                     TICK
+                }
+                Err(e) if is_app_down(&e) && app_down < APP_DOWN_TRIES => {
+                    app_down += 1;
+                    eprintln!("1Password app not running; retrying in {}s", APP_DOWN_RETRY.as_secs());
+                    APP_DOWN_RETRY
                 }
                 Err(e) if is_dismissed(&e) => {
                     let w = BACKOFF[dismissed.min(BACKOFF.len() - 1)];

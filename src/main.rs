@@ -67,6 +67,27 @@ enum Cmd {
     DeleteItem { path: String },
 }
 
+/// The sync daemon's answer to a one-time code request.
+#[derive(Clone, Debug, PartialEq)]
+enum OtpReply {
+    /// The code and the seconds it has left.
+    Code(String, u64),
+    /// The item has no one-time password field.
+    Absent,
+    Failed(String),
+}
+
+/// The selected entry's one-time code, as far as the UI knows it.
+enum Otp {
+    /// Asked; nothing to show yet.
+    Pending,
+    /// `refreshing`: expired and re-asked — the old code stays up meanwhile,
+    /// at 0 s, rather than blinking out for the length of an `op` call.
+    Code { code: String, until: std::time::Instant, refreshing: bool },
+    /// Reported on the status line; not re-asked until the selection moves.
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 enum AppMessage {
     Loaded(Vec<EntryData>),
@@ -80,6 +101,8 @@ enum AppMessage {
     SyncClicked,
     RevealClicked,
     CopyClicked,
+    CopyOtpClicked,
+    Otp { path: String, reply: OtpReply },
     NewClicked,
     EditClicked,
     DeleteClicked,
@@ -188,6 +211,81 @@ async fn run_sync() -> (String, bool) {
             return (format!("cce-keyring-sync not runnable: {e}"), true);
         }
     }
+}
+
+// ── One-time codes ────────────────────────────────────────────────────────
+//
+// Asked of the resident cce-keyring-sync daemon over its socket
+// (src/bin/cce-keyring-sync/serve.rs): it holds the session's `op`
+// authorization, so a code costs no Authorize dialog — this process running
+// `op` itself would raise one per launch. 1Password computes the code; the
+// seed never leaves it. Only entries carrying an `op-item` stamp (the ones
+// the sync pairs) can have one.
+
+fn otp_socket() -> Option<std::path::PathBuf> {
+    // For a shadow test against a stand-in daemon: the shadow shares the
+    // live runtime dir, and binding the real path would unseat the live one.
+    if let Some(p) = std::env::var_os("CCE_KEYRING_SYNC_SOCK") {
+        return Some(p.into());
+    }
+    let dir = std::env::var("XDG_RUNTIME_DIR").ok().filter(|s| !s.is_empty())?;
+    Some(std::path::PathBuf::from(dir).join("cce/keyring-sync.sock"))
+}
+
+/// Blocking: run it off the UI thread. A request that has to raise the
+/// Authorize dialog (the daemon's authorization lapsed) waits out its 60 s.
+fn request_otp(item_id: &str) -> OtpReply {
+    use std::io::{BufRead, Write};
+    let Some(path) = otp_socket() else {
+        return OtpReply::Failed("no XDG_RUNTIME_DIR".into());
+    };
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
+        return OtpReply::Failed("the sync daemon is not running (cce-keyring-sync.service)".into());
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(80)));
+    if writeln!(stream, "otp {item_id}").is_err() {
+        return OtpReply::Failed("the sync daemon hung up".into());
+    }
+    let mut line = String::new();
+    match std::io::BufReader::new(stream).read_line(&mut line) {
+        Ok(n) if n > 0 => parse_otp_reply(line.trim_end()),
+        _ => OtpReply::Failed("no answer from the sync daemon".into()),
+    }
+}
+
+fn parse_otp_reply(line: &str) -> OtpReply {
+    if line == "none" {
+        return OtpReply::Absent;
+    }
+    if let Some(e) = line.strip_prefix("err ") {
+        return OtpReply::Failed(e.to_string());
+    }
+    let mut parts = line.strip_prefix("otp ").unwrap_or("").split(' ');
+    match (parts.next(), parts.next().and_then(|t| t.parse().ok())) {
+        (Some(code), Some(left)) if !code.is_empty() => OtpReply::Code(code.to_string(), left),
+        _ => OtpReply::Failed(format!("unreadable reply: {line}")),
+    }
+}
+
+/// "123456" → "123 456"; any other length as is.
+fn group_code(code: &str) -> String {
+    if code.len() == 6 && code.is_ascii() {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
+/// Put `text` on the clipboard, and take it off again after
+/// [`CLIPBOARD_CLEAR_SECS`] if it is still there.
+fn copy_then_clear(text: String) {
+    cce_ui::widget::clipboard::copy_to_clipboard(&text);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+        if cce_ui::widget::clipboard::read_from_clipboard().as_deref() == Some(text.as_str()) {
+            cce_ui::widget::clipboard::copy_to_clipboard("");
+        }
+    });
 }
 
 // ── Secret Service worker ─────────────────────────────────────────────────
@@ -356,18 +454,11 @@ async fn fetch_secret(
     let secret = String::from_utf8_lossy(&bytes).to_string();
     match purpose {
         Purpose::Copy => {
-            cce_ui::widget::clipboard::copy_to_clipboard(&secret);
+            copy_then_clear(secret);
             let _ = tx.send(AppMessage::Status(
                 format!("Secret copied — clipboard clears in {CLIPBOARD_CLEAR_SECS} s"),
                 false,
             ));
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(CLIPBOARD_CLEAR_SECS));
-                // Only clear if the clipboard still holds our secret.
-                if cce_ui::widget::clipboard::read_from_clipboard().as_deref() == Some(secret.as_str()) {
-                    cce_ui::widget::clipboard::copy_to_clipboard("");
-                }
-            });
         }
         Purpose::Reveal => {
             let _ = tx.send(AppMessage::Revealed { path, secret });
@@ -460,6 +551,7 @@ struct SecretsApp {
     new_btn: cce_ui::widget::Adapted<Button>,
     reveal_btn: cce_ui::widget::Adapted<Button>,
     copy_btn: cce_ui::widget::Adapted<Button>,
+    otp_btn: cce_ui::widget::Adapted<Button>,
     edit_btn: cce_ui::widget::Adapted<Button>,
     delete_btn: cce_ui::widget::Adapted<Button>,
     save_btn: cce_ui::widget::Adapted<Button>,
@@ -479,6 +571,13 @@ struct SecretsApp {
     revealed: Option<(String, String)>,
     /// Path armed for deletion by the first Delete click.
     pending_delete: Option<String>,
+    /// (entry path, its one-time code) for the selected entry; `ensure_otp`
+    /// keeps it following the selection and the code's 30 s period.
+    otp: Option<(String, Otp)>,
+    /// Entries the daemon said have no code: not asked again this run.
+    otp_absent: std::collections::HashSet<String>,
+    /// The countdown second last painted, so `tick` redraws once a second.
+    otp_drawn_left: u64,
 
     /// The DRAWN list offset — `scroll_motion` glides it (wheel) or coasts
     /// it (trackpad flick); direct writes (Escape reset, clamp) are adopted
@@ -573,6 +672,57 @@ impl SecretsApp {
 
     fn editing(&self) -> bool {
         matches!(self.mode, Mode::Edit { .. })
+    }
+
+    /// The code to show for the selected entry, with its seconds left.
+    fn shown_otp(&self) -> Option<(&str, u64)> {
+        let sel = self.selected.as_deref()?;
+        match &self.otp {
+            Some((path, Otp::Code { code, until, .. })) if path == sel => {
+                let left = until.saturating_duration_since(std::time::Instant::now()).as_secs_f32().ceil() as u64;
+                Some((code.as_str(), left))
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep `otp` on the selected entry: ask the daemon when the selection
+    /// lands on a paired entry, and again when the code runs out. True when
+    /// anything visible changed.
+    fn ensure_otp(&mut self) -> bool {
+        let want = self
+            .selected_entry()
+            .filter(|e| !e.attr("op-item").is_empty() && !self.otp_absent.contains(&e.path))
+            .map(|e| (e.path.clone(), e.attr("op-item").to_string()));
+        let Some((path, item_id)) = want.filter(|_| !self.editing()) else {
+            return self.otp.take().is_some();
+        };
+        let ask = match &mut self.otp {
+            Some((p, _)) if *p != path => true,
+            None => true,
+            Some((_, Otp::Code { until, refreshing, .. })) => {
+                if !*refreshing && std::time::Instant::now() >= *until {
+                    *refreshing = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some((_, Otp::Pending | Otp::Failed)) => false,
+        };
+        if !ask {
+            return false;
+        }
+        let changed = !matches!(&self.otp, Some((p, Otp::Code { .. })) if *p == path);
+        if changed {
+            self.otp = Some((path.clone(), Otp::Pending));
+        }
+        let tx = self.sender.clone();
+        std::thread::spawn(move || {
+            let reply = request_otp(&item_id);
+            let _ = tx.send(AppMessage::Otp { path, reply });
+        });
+        changed
     }
 
     fn form_boxes_mut(&mut self) -> [&mut cce_ui::widget::Adapted<TextBox>; 5] {
@@ -670,13 +820,14 @@ impl SecretsApp {
             .unwrap_or_default();
     }
 
-    fn buttons_mut(&mut self) -> [&mut cce_ui::widget::Adapted<Button>; 9] {
+    fn buttons_mut(&mut self) -> [&mut cce_ui::widget::Adapted<Button>; 10] {
         [
             &mut self.refresh_btn,
             &mut self.sync_btn,
             &mut self.new_btn,
             &mut self.reveal_btn,
             &mut self.copy_btn,
+            &mut self.otp_btn,
             &mut self.edit_btn,
             &mut self.delete_btn,
             &mut self.save_btn,
@@ -692,6 +843,7 @@ impl SecretsApp {
             &self.new_btn,
             &self.reveal_btn,
             &self.copy_btn,
+            &self.otp_btn,
             &self.edit_btn,
             &self.delete_btn,
             &self.save_btn,
@@ -734,6 +886,7 @@ impl Application for SecretsApp {
             new_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("New"),
             reveal_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Reveal"),
             copy_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Copy"),
+            otp_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Copy code"),
             edit_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Edit"),
             delete_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Delete"),
             save_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Save"),
@@ -748,6 +901,9 @@ impl Application for SecretsApp {
             selected: None,
             revealed: None,
             pending_delete: None,
+            otp: None,
+            otp_absent: std::collections::HashSet::new(),
+            otp_drawn_left: 0,
             scroll_y: 0.0,
             scroll_motion: ScrollMotion::new(),
             // Placed by the first frame; empty until then so nothing hit-tests.
@@ -848,6 +1004,39 @@ impl Application for SecretsApp {
                     let _ = self.cmd_tx.send(Cmd::GetSecret { path: sel, purpose: Purpose::Copy });
                 }
             }
+            AppMessage::CopyOtpClicked => {
+                if let Some((code, _)) = self.shown_otp() {
+                    copy_then_clear(code.to_string());
+                    self.status_msg = format!("Code copied — clipboard clears in {CLIPBOARD_CLEAR_SECS} s");
+                    self.status_is_error = false;
+                }
+            }
+            AppMessage::Otp { path, reply } => {
+                // A reply for an entry no longer selected is dropped; the
+                // next selection asks afresh.
+                if self.otp.as_ref().is_none_or(|(p, _)| *p != path) {
+                    return;
+                }
+                self.otp = match reply {
+                    OtpReply::Code(code, left) => Some((
+                        path,
+                        Otp::Code {
+                            code,
+                            until: std::time::Instant::now() + std::time::Duration::from_secs(left),
+                            refreshing: false,
+                        },
+                    )),
+                    OtpReply::Absent => {
+                        self.otp_absent.insert(path);
+                        None
+                    }
+                    OtpReply::Failed(e) => {
+                        self.status_msg = format!("One-time code: {e}");
+                        self.status_is_error = true;
+                        Some((path, Otp::Failed))
+                    }
+                };
+            }
             AppMessage::NewClicked => self.open_form(None),
             AppMessage::EditClicked => {
                 if let Some(entry) = self.selected_entry().cloned() {
@@ -884,6 +1073,18 @@ impl Application for SecretsApp {
         if self.tick_scroll(dt) {
             *needs_rebuild = true;
         }
+        if self.ensure_otp() {
+            *needs_rebuild = true;
+        }
+        if self.shown_otp().is_some_and(|(_, left)| left != self.otp_drawn_left) {
+            *needs_rebuild = true;
+        }
+    }
+
+    /// While a code is up, wake often enough to step its countdown (tick
+    /// dt is not wall clock; the deadline is an `Instant`).
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        self.shown_otp().map(|_| std::time::Duration::from_millis(250))
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
@@ -908,6 +1109,8 @@ impl Application for SecretsApp {
             let (id, ptr) = (self.reveal_btn.id(), self.reveal_btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
             let (id, ptr) = (self.copy_btn.id(), self.copy_btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+            let (id, ptr) = (self.otp_btn.id(), self.otp_btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
             let (id, ptr) = (self.edit_btn.id(), self.edit_btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
@@ -1035,7 +1238,7 @@ impl Application for SecretsApp {
                 }
                 self.save_btn.set_rect(dx, fy, BTN_W, BTN_H);
                 self.cancel_btn.set_rect(dx + BTN_W + pgap, fy, BTN_W, BTN_H);
-                for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.edit_btn, &mut self.delete_btn, &mut self.new_btn] {
+                for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.otp_btn, &mut self.edit_btn, &mut self.delete_btn, &mut self.new_btn] {
                     park(b);
                 }
             }
@@ -1066,6 +1269,14 @@ impl Application for SecretsApp {
                     };
                     pc.text_with(secret_text, dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
 
+                    let otp = self.shown_otp().map(|(code, left)| (group_code(code), left));
+                    if let Some((code, left)) = &otp {
+                        self.otp_drawn_left = *left;
+                        ay += 22.0;
+                        pc.text_with("one-time code".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                        pc.text_with(format!("{code}  ·  {left}s"), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
+                    }
+
                     self.reveal_btn.set_label(if revealed { "Hide" } else { "Reveal" });
                     self.delete_btn.set_label(
                         if self.pending_delete.as_deref() == Some(entry.path.as_str()) { "Confirm" } else { "Delete" },
@@ -1076,10 +1287,22 @@ impl Application for SecretsApp {
                     self.copy_btn.set_rect(dx + BTN_W + pgap, by, BTN_W, BTN_H);
                     self.edit_btn.set_rect(dx, by + BTN_H + pgap, BTN_W, BTN_H);
                     self.delete_btn.set_rect(dx + BTN_W + pgap, by + BTN_H + pgap, BTN_W, BTN_H);
+                    // Copy code ends the first row when the pane is wide
+                    // enough, else opens a third.
+                    if otp.is_some() {
+                        let third = dx + 2.0 * (BTN_W + pgap);
+                        if third + BTN_W <= dx + dw {
+                            self.otp_btn.set_rect(third, by, BTN_W, BTN_H);
+                        } else {
+                            self.otp_btn.set_rect(dx, by + 2.0 * (BTN_H + pgap), BTN_W, BTN_H);
+                        }
+                    } else {
+                        park(&mut self.otp_btn);
+                    }
                 } else {
                     let hint = if self.entries.is_empty() { "" } else { "Select an entry" };
                     pc.text_with(hint.to_string(), dx, hy, 11.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
-                    for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.edit_btn, &mut self.delete_btn] {
+                    for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.otp_btn, &mut self.edit_btn, &mut self.delete_btn] {
                         park(b);
                     }
                 }
@@ -1181,6 +1404,9 @@ impl Application for SecretsApp {
         }
         if self.copy_btn.take_click() {
             return Some(AppMessage::CopyClicked);
+        }
+        if self.otp_btn.take_click() {
+            return Some(AppMessage::CopyOtpClicked);
         }
         if self.edit_btn.take_click() {
             return Some(AppMessage::EditClicked);
@@ -1321,4 +1547,20 @@ impl Application for SecretsApp {
 fn main() {
     env_logger::init();
     cce_ui::engine::run::<SecretsApp>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_replies_parse() {
+        assert_eq!(parse_otp_reply("otp 123456 17"), OtpReply::Code("123456".into(), 17));
+        assert_eq!(parse_otp_reply("none"), OtpReply::Absent);
+        assert_eq!(parse_otp_reply("err not a mirrored item"), OtpReply::Failed("not a mirrored item".into()));
+        assert!(matches!(parse_otp_reply("otp 123456"), OtpReply::Failed(_)));
+        assert!(matches!(parse_otp_reply(""), OtpReply::Failed(_)));
+        assert_eq!(group_code("123456"), "123 456");
+        assert_eq!(group_code("12345678"), "12345678");
+    }
 }

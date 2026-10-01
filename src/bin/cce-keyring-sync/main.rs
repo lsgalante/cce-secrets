@@ -7,7 +7,8 @@
 //! sides already hold and seeds the base; `sync` is one three-way merge
 //! pass (sync.rs); `daemon` is the resident loop the systemd unit runs
 //! (daemon.rs) — resident because the CLI's authorization is keyed to the
-//! calling process's parent and lapses when idle.
+//! calling process's parent and lapses when idle. The daemon also serves
+//! one-time codes to cce-secrets over a socket (serve.rs).
 //!
 //! Discipline kept from the kdbx era this replaced (2026-09-21):
 //! - the state file stores keyed hashes of fields, never values; the hash
@@ -22,6 +23,7 @@
 mod adopt;
 mod daemon;
 mod op;
+mod serve;
 mod sync;
 
 use std::collections::HashMap;
