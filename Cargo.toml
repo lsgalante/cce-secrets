@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "25989d64afc740daae92a0ee0852a79f2eb5621d" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "5819283a207d9f304669d674f946f6429eb7f75b" }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
 tokio = { version = "1", features = ["full"] }
