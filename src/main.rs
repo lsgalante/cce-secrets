@@ -120,14 +120,7 @@ enum Mode {
 /// cce-keyring-sync's state file: `last_run` (unix seconds) and the last
 /// run's one-line outcome. The daemon's only channel back to this UI.
 fn sync_state_path() -> std::path::PathBuf {
-    std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("cce/keyring-sync/state.json")
+    cce_ui::config::cce_state_dir().join("keyring-sync/state.json")
 }
 
 fn read_sync_state() -> Option<(i64, String)> {

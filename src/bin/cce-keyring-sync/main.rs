@@ -66,16 +66,7 @@ pub(crate) struct EntryState {
 }
 
 pub(crate) fn state_dir() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"));
-    base.join("cce/keyring-sync")
-}
-
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME"))
+    cce_ui::config::cce_state_dir().join("keyring-sync")
 }
 
 pub(crate) fn now_unix() -> i64 {
