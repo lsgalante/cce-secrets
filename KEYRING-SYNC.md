@@ -644,8 +644,9 @@ daemon's back-off covers the gap until it is measured. (Answered
 The question was whether cce programs could replace 1Password's graphical
 frontend. Two shapes were weighed:
 
-- **A — the app stays, headless.** It keeps running (autostart already
-  passes `--silent`, so no main window opens) as what `op` authorizes
+- **A — the app stays, headless.** It keeps running (`cce-1password.service`
+  starts it with `--silent`, so no main window opens; its own XDG autostart
+  entry never fires under cce) as what `op` authorizes
   against and what syncs with 1Password's servers; cce-secrets is the only
   window anyone browses in. **Chosen.**
 - **B — the app goes.** `op` without the integration signs in on its own
