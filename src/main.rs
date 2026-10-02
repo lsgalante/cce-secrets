@@ -277,15 +277,54 @@ fn group_code(code: &str) -> String {
 }
 
 /// Put `text` on the clipboard, and take it off again after
-/// [`CLIPBOARD_CLEAR_SECS`] if it is still there.
+/// [`CLIPBOARD_CLEAR_SECS`].
+///
+/// The clipboard is served by `wl-copy --foreground` under `timeout`, in a
+/// process group of its own, so the clear does not depend on this app: when
+/// `timeout` ends `wl-copy`, the offer it was serving goes with it. Until
+/// 2026-10-02 the clear was a thread in this process while a forked
+/// `wl-copy` kept serving the secret, so closing cce-secrets within the 30s
+/// left the password on the clipboard indefinitely. If something else is
+/// copied first, `wl-copy` has already exited on losing the selection, so
+/// the timer can never wipe the newer content. `--sensitive` sets the
+/// `x-kde-passwordManagerHint` that clipboard-history tools honour.
+///
+/// Falls back to the old in-process clear when `timeout` or `wl-copy` is
+/// missing.
 fn copy_then_clear(text: String) {
-    cce_ui::widget::clipboard::copy_to_clipboard(&text);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(CLIPBOARD_CLEAR_SECS));
-        if cce_ui::widget::clipboard::read_from_clipboard().as_deref() == Some(text.as_str()) {
-            cce_ui::widget::clipboard::copy_to_clipboard("");
+    use std::os::unix::process::CommandExt;
+    let spawned = std::process::Command::new("timeout")
+        .arg(CLIPBOARD_CLEAR_SECS.to_string())
+        .args(["wl-copy", "--foreground", "--sensitive"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            // The secret goes in on stdin, never argv. The thread reaps the
+            // child while this app lives; if the app exits first, the child
+            // carries on and is reaped by whoever inherits it.
+            std::thread::spawn(move || {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+            });
         }
-    });
+        Err(e) => {
+            eprintln!("cce-secrets: timeout/wl-copy unavailable ({e}); clearing in-process");
+            cce_ui::widget::clipboard::copy_to_clipboard(&text);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                if cce_ui::widget::clipboard::read_from_clipboard().as_deref() == Some(text.as_str()) {
+                    cce_ui::widget::clipboard::copy_to_clipboard("");
+                }
+            });
+        }
+    }
 }
 
 // ── Secret Service worker ─────────────────────────────────────────────────
