@@ -57,7 +57,7 @@ pub async fn daemon(state_path: &std::path::Path) {
             TICK
         } else {
             let mut remote = OnePassword::new(&state.vault);
-            match sync_remote(&mut remote, state_path, &mut state, false).await {
+            match sync_remote(&mut remote, state_path, &mut state, false, false).await {
                 Ok(_) => {
                     dismissed = 0;
                     app_down = 0;

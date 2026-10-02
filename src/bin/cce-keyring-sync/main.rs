@@ -178,6 +178,7 @@ pub(crate) fn write_state(state_path: &Path, state: &State) {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let allow_mass_delete = args.iter().any(|a| a == "--allow-mass-delete");
     let vault_flag = args
         .iter()
         .position(|a| a == "--vault")
@@ -204,6 +205,7 @@ async fn main() {
         Some(c @ ("sync" | "status" | "adopt" | "daemon")) => c.to_string(),
         _ => {
             eprintln!("usage: cce-keyring-sync sync   [--dry-run]                  (one merge pass; raises its own Authorize dialog)");
+            eprintln!("       cce-keyring-sync sync   --allow-mass-delete          (let one pass remove more than a tenth of the synced items)");
             eprintln!("       cce-keyring-sync daemon                              (resident; what cce-keyring-sync.service runs)");
             eprintln!("       cce-keyring-sync adopt  [--dry-run] [--vault <name>]  (pair the keyring with 1Password, seed the base)");
             eprintln!("       cce-keyring-sync status");
@@ -235,7 +237,7 @@ async fn main() {
             // A one-shot pass; the daemon is the usual caller, and the flock
             // keeps the two apart.
             let mut remote = op::OnePassword::new(&state.vault);
-            if let Err(e) = sync::sync_remote(&mut remote, &state_path, &mut state, dry_run).await {
+            if let Err(e) = sync::sync_remote(&mut remote, &state_path, &mut state, dry_run, allow_mass_delete).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }

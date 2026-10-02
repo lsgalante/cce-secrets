@@ -147,11 +147,30 @@ struct Local<'a> {
 /// One merge pass. Always writes the state file on a real run (with
 /// `last_result` set to the outcome, success or not) unless it could not
 /// even start. Returns the one-line summary, or the error.
+/// Removals one pass may make before it is refused: deletions from the
+/// keyring plus archives in 1Password, at most 10% of the synced entries
+/// and never fewer than this.
+const MASS_REMOVAL_FLOOR: usize = 5;
+
+/// Whether a pass removing `removals` items, with `synced` entries in the
+/// base, looks like a mistake rather than an edit.
+///
+/// Nothing else bounded it. The vault is named, not pinned by id, and `op`
+/// uses its default account, so a second account with its own "Personal"
+/// vault becoming the default would list entirely different items: every
+/// synced entry would read as deleted in 1Password, and the pass would
+/// hard-delete all of them from the keyring. People delete a few items at a
+/// time; a pass that would remove a tenth of everything stops and says so.
+pub fn is_mass_removal(removals: usize, synced: usize) -> bool {
+    removals > MASS_REMOVAL_FLOOR.max(synced / 10)
+}
+
 pub async fn sync_remote<I: Interchange>(
     remote: &mut I,
     state_path: &std::path::Path,
     state: &mut State,
     dry_run: bool,
+    allow_mass_removal: bool,
 ) -> Result<String, String> {
     let Some(_lock) = take_lock() else {
         return Err("another cce-keyring-sync is running".into());
@@ -322,6 +341,16 @@ pub async fn sync_remote<I: Interchange>(
     if dry_run {
         println!("{summary} (dry run — nothing changed; {fetches} fetched)");
         return Ok(summary);
+    }
+    let removals = c("deleted") + c("archived");
+    if !allow_mass_removal && is_mass_removal(removals, state.entries.len()) {
+        return Err(format!(
+            "refusing a pass that would remove {removals} of {} synced items ({}) — nothing changed. \
+             If 1Password's default account or vault changed, fix that; if the removals are meant, \
+             run `cce-keyring-sync sync --dry-run` to review them, then `cce-keyring-sync sync --allow-mass-delete`",
+            state.entries.len(),
+            summary
+        ));
     }
 
     // ---- apply ----
@@ -522,6 +551,24 @@ pub async fn sync_remote<I: Interchange>(
     }
     println!("{} ({fetches} fetched)", state.last_result);
     result
+}
+
+#[cfg(test)]
+mod mass_removal_tests {
+    use super::is_mass_removal;
+
+    #[test]
+    fn a_pass_removing_a_tenth_of_the_vault_is_refused() {
+        // The live vault is ~378 entries: 37 removals pass, 38 stop.
+        assert!(!is_mass_removal(37, 378));
+        assert!(is_mass_removal(38, 378));
+        // Every entry reading as gone — the wrong-account case.
+        assert!(is_mass_removal(378, 378));
+        // Small vaults still allow a handful.
+        assert!(!is_mass_removal(5, 12));
+        assert!(is_mass_removal(6, 12));
+        assert!(!is_mass_removal(0, 0));
+    }
 }
 
 #[cfg(test)]
