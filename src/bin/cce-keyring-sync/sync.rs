@@ -169,7 +169,17 @@ pub async fn sync_remote<I: Interchange>(
         _ => return Err("no state hash key — run `cce-keyring-sync adopt` first".into()),
     };
     let col = ss.get_default_collection().await.map_err(|e| format!("no default collection: {e}"))?;
-    if col.is_locked().await.unwrap_or(false) && col.unlock().await.is_err() {
+    // A read the keyring could not answer must stop the pass, never stand
+    // in as an empty value. Until 2026-10-02 every read below fell back to a
+    // default — a lock state of "unlocked", an empty password and title, a
+    // modified time of 0 — so a keyring that locked or restarted mid-pass
+    // read as every item having been blanked here, which the plan then
+    // pushed to 1Password as edits (and other machines pulled back). An item
+    // whose attributes failed to read was skipped, which read as deleted and
+    // archived its 1Password copy. A pass that errs writes nothing: the
+    // snapshot is taken before any plan is applied, and the daemon retries.
+    let locked = col.is_locked().await.map_err(|e| format!("cannot tell whether the keyring is locked: {e}"))?;
+    if locked && col.unlock().await.is_err() {
         return Err("collection locked".into());
     }
 
@@ -177,7 +187,10 @@ pub async fn sync_remote<I: Interchange>(
     let mut kr: HashMap<String, Local<'_>> = HashMap::new();
     let mut born: Vec<Local<'_>> = Vec::new();
     for item in col.get_all_items().await.map_err(|e| format!("listing collection failed: {e}"))? {
-        let Ok(attrs) = item.get_attributes().await else { continue };
+        let attrs = item
+            .get_attributes()
+            .await
+            .map_err(|e| format!("reading an item's attributes failed: {e}; nothing synced this pass"))?;
         if attrs.get("application").map(String::as_str) == Some(APP) {
             continue;
         }
@@ -185,14 +198,21 @@ pub async fn sync_remote<I: Interchange>(
         if id.is_none() && !attrs.contains_key("UserName") && !attrs.contains_key("kdbx-uuid") {
             continue; // some other app's item — never ours to sync
         }
+        let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+            let which = attrs.get(OP_ITEM_ATTR).map(String::as_str).unwrap_or("an unpaired item");
+            format!("reading the {what} of {which} failed: {e}; nothing synced this pass")
+        };
+        let title = item.get_label().await.map_err(|e| unreadable("title", &e))?;
+        let secret = item.get_secret().await.map_err(|e| unreadable("password", &e))?;
+        let modified = item.get_modified().await.map_err(|e| unreadable("modified time", &e))?;
         let entry = KrEntry {
-            title: item.get_label().await.unwrap_or_default(),
+            title,
             username: attrs.get("UserName").cloned().unwrap_or_default(),
-            password: String::from_utf8_lossy(&item.get_secret().await.unwrap_or_default()).into_owned(),
+            password: String::from_utf8_lossy(&secret).into_owned(),
             url: attrs.get("URL").cloned().unwrap_or_default(),
             notes: attrs.get("Notes").cloned().unwrap_or_default(),
             group: attrs.get(OP_VAULT_ATTR).cloned().unwrap_or_else(|| vault.clone()),
-            modified: item.get_modified().await.unwrap_or(0),
+            modified,
         };
         let local = Local { item, attrs, entry };
         match id {

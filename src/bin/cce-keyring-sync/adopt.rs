@@ -181,7 +181,17 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
             std::process::exit(1);
         }
     };
-    if col.is_locked().await.unwrap_or(false) && col.unlock().await.is_err() {
+    // As in `sync_remote`: a read the keyring cannot answer stops the run
+    // rather than standing in as an empty value, which would pair an item
+    // under a blank password.
+    let locked = match col.is_locked().await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot tell whether the keyring is locked: {e}");
+            std::process::exit(1);
+        }
+    };
+    if locked && col.unlock().await.is_err() {
         eprintln!("collection locked");
         std::process::exit(1);
     }
@@ -191,21 +201,31 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
     match col.get_all_items().await {
         Ok(items) => {
             for item in items {
-                let Ok(attrs) = item.get_attributes().await else { continue };
+                let attrs = item.get_attributes().await.unwrap_or_else(|e| {
+                    eprintln!("reading an item's attributes failed: {e}; nothing adopted");
+                    std::process::exit(1);
+                });
                 if attrs.get("application").map(String::as_str) == Some(APP) {
                     continue;
                 }
                 if !attrs.contains_key("UserName") && !attrs.contains_key("kdbx-uuid") {
                     continue;
                 }
+                let unreadable = |what: &str, e: &dyn std::fmt::Display| -> ! {
+                    eprintln!("reading the {what} of a keyring login failed: {e}; nothing adopted");
+                    std::process::exit(1);
+                };
+                let title = item.get_label().await.unwrap_or_else(|e| unreadable("title", &e));
+                let secret = item.get_secret().await.unwrap_or_else(|e| unreadable("password", &e));
+                let modified = item.get_modified().await.unwrap_or_else(|e| unreadable("modified time", &e));
                 let entry = KrEntry {
-                    title: item.get_label().await.unwrap_or_default(),
+                    title,
                     username: attrs.get("UserName").cloned().unwrap_or_default(),
-                    password: String::from_utf8_lossy(&item.get_secret().await.unwrap_or_default()).into_owned(),
+                    password: String::from_utf8_lossy(&secret).into_owned(),
                     url: attrs.get("URL").cloned().unwrap_or_default(),
                     notes: attrs.get("Notes").cloned().unwrap_or_default(),
                     group: String::new(), // becomes the vault name once paired
-                    modified: item.get_modified().await.unwrap_or(0),
+                    modified,
                 };
                 locals.push(Local { item, attrs, entry });
             }

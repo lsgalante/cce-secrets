@@ -502,6 +502,31 @@ async fn create_item(
     Ok(())
 }
 
+/// What an edit leaves on an item: its current attributes with the form's
+/// fields laid over them. A field the form left empty is removed; every
+/// attribute the form does not show is kept as it is.
+///
+/// Until 2026-10-02 a save wrote the form's fields ALONE, and the Secret
+/// Service's `set_attributes` replaces the whole set. On a 1Password-paired
+/// item that dropped `op-item` / `op-vault`, so the next sync saw a new
+/// keyring item and an untouched remote one: it created a bare duplicate in
+/// 1Password and archived the original with its one-time-code seed and
+/// custom fields. On another app's item ("Chrome Safe Storage") it dropped
+/// `xdg:schema` and the lookup attributes the app finds its secret by.
+fn merge_edited_attributes(
+    mut current: std::collections::HashMap<String, String>,
+    edits: &[(String, String)],
+) -> std::collections::HashMap<String, String> {
+    for (key, value) in edits {
+        if value.is_empty() {
+            current.remove(key);
+        } else {
+            current.insert(key.clone(), value.clone());
+        }
+    }
+    current
+}
+
 async fn update_item(
     ss: &SecretService<'_>,
     tx: &calloop::channel::Sender<AppMessage>,
@@ -512,10 +537,17 @@ async fn update_item(
 ) -> Result<(), String> {
     let item = resolve_item(ss, &path).await?;
     let _ = item.ensure_unlocked().await;
+    // Read before anything is written: `set_attributes` replaces the whole
+    // set, so without the current attributes there is nothing safe to save.
+    let current = item
+        .get_attributes()
+        .await
+        .map_err(|e| format!("Reading the item's attributes failed: {e}"))?;
     item.set_label(&label)
         .await
         .map_err(|e| format!("Saving label failed: {e}"))?;
-    let attr_map = attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let merged = merge_edited_attributes(current, &attrs);
+    let attr_map = merged.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     item.set_attributes(attr_map)
         .await
         .map_err(|e| format!("Saving attributes failed: {e}"))?;
@@ -775,10 +807,11 @@ impl SecretsApp {
         }
         let values = [&self.user_box, &self.url_box, &self.notes_box]
             .map(|b| live_text(b).trim().to_string());
+        // Every edited field, empty ones included: an update removes what was
+        // cleared (`merge_edited_attributes`); a new item just skips them.
         let attrs: Vec<(String, String)> = EDIT_ATTRS
             .iter()
             .zip(values)
-            .filter(|(_, v)| !v.is_empty())
             .map(|(k, v)| (k.to_string(), v))
             .collect();
         let password = live_text(&self.pass_box).to_string();
@@ -790,7 +823,11 @@ impl SecretsApp {
                 attrs,
                 secret: (!password.is_empty()).then_some(password),
             },
-            None => Cmd::CreateItem { label: title, attrs, secret: password },
+            None => Cmd::CreateItem {
+                label: title,
+                attrs: attrs.into_iter().filter(|(_, v)| !v.is_empty()).collect(),
+                secret: password,
+            },
         })
     }
 
@@ -1552,6 +1589,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_keeps_every_attribute_the_form_does_not_show() {
+        let current: std::collections::HashMap<String, String> = [
+            ("op-item", "abc123"),
+            ("op-vault", "Personal"),
+            ("xdg:schema", "org.freedesktop.Secret.Generic"),
+            ("UserName", "old@example.org"),
+            ("URL", "https://old.example.org"),
+            ("Notes", "keep me"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let edits = vec![
+            ("UserName".to_string(), "new@example.org".to_string()),
+            ("URL".to_string(), String::new()),
+            ("Notes".to_string(), "keep me".to_string()),
+        ];
+        let merged = merge_edited_attributes(current, &edits);
+        // The pairing and the schema survive: losing them is what duplicated
+        // and archived 1Password items.
+        assert_eq!(merged.get("op-item").map(String::as_str), Some("abc123"));
+        assert_eq!(merged.get("op-vault").map(String::as_str), Some("Personal"));
+        assert_eq!(merged.get("xdg:schema").map(String::as_str), Some("org.freedesktop.Secret.Generic"));
+        // The form's fields are what it says: changed, cleared, unchanged.
+        assert_eq!(merged.get("UserName").map(String::as_str), Some("new@example.org"));
+        assert!(!merged.contains_key("URL"), "a cleared field is removed");
+        assert_eq!(merged.get("Notes").map(String::as_str), Some("keep me"));
+        assert_eq!(merged.len(), 5);
+    }
 
     #[test]
     fn daemon_replies_parse() {
