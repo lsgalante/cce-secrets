@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 /// prompt reports itself as such instead of as a kill.
 pub const OP_TIMEOUT: Duration = Duration::from_secs(75);
 
+/// Serializes every `op` spawn in this process (see `run_as`).
+static OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The text `op` prints when the Authorize dialog timed out unanswered.
 const DISMISSED: &str = "authorization prompt dismissed";
 /// What `op` prints when nobody unlocked the app in time: the first call of
@@ -99,11 +102,13 @@ pub struct OnePassword {
     pub vault: String,
     /// `--account`, for a person with several signed in. Empty: op's default.
     pub account: String,
+    /// The program run: `op` from PATH; a stand-in script under test.
+    pub bin: String,
 }
 
 impl OnePassword {
     pub fn new(vault: &str) -> Self {
-        OnePassword { vault: vault.to_string(), account: String::new() }
+        OnePassword { vault: vault.to_string(), account: String::new(), bin: "op".to_string() }
     }
 
     /// Spawn `op` as a direct child (the authorization is keyed to *our*
@@ -116,7 +121,14 @@ impl OnePassword {
     /// `run`, with `--format json` optional: `--otp` refuses it.
     async fn run_as(&self, args: &[&str], stdin: Option<Vec<u8>>, json: bool) -> Result<Vec<u8>, String> {
         use tokio::io::AsyncWriteExt;
-        let mut cmd = tokio::process::Command::new("op");
+        // One `op` at a time per process. Each call still waiting on the
+        // Authorize dialog gets a dialog of its own: at login the first
+        // tick's `item list` sat on its dialog while a cce-secrets code
+        // request spawned `item get --otp`, and the user answered two
+        // identical dialogs (2026-10-02, both logins that day). Queued
+        // behind the pending call, the second inherits its authorization.
+        let _one_at_a_time = OP_LOCK.lock().await;
+        let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.args(args);
         if json {
             cmd.arg("--format").arg("json");
@@ -517,5 +529,30 @@ mod tests {
         assert!(is_dismissed("op item: authorization timeout"));
         assert!(is_app_down("op item: connecting to desktop app: cannot connect to 1Password app, make sure it is running"));
         assert!(!is_app_down("op item: authorization timeout"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn op_calls_never_overlap() {
+        // A code request arriving while the tick's call waits on its dialog
+        // must queue behind it, not raise a second dialog of its own.
+        let dir = std::env::temp_dir().join(format!("op-serial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let bin = dir.join("op");
+        std::fs::write(&bin, format!("#!/bin/sh\necho start >> '{0}'\nsleep 0.3\necho end >> '{0}'\n", log.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut op = OnePassword::new("v");
+        op.bin = bin.to_str().unwrap().to_string();
+        let calls = (0..3).map(|_| {
+            let op = OnePassword { bin: op.bin.clone(), ..OnePassword::new("v") };
+            tokio::spawn(async move { op.run(&["item", "list"], None).await })
+        });
+        for c in calls.collect::<Vec<_>>() {
+            c.await.unwrap().unwrap();
+        }
+        let lines = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lines, "start\nend\n".repeat(3), "op calls overlapped");
     }
 }

@@ -58,9 +58,9 @@ pub async fn serve(state_path: PathBuf) {
     }
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
-        // Its own task: a code request that raises a dialog holds `op`
-        // for up to a minute, and must hold neither the tick nor the
-        // next request.
+        // Its own task, so a slow reply holds no other connection. The
+        // `op` call itself queues behind any in flight (op.rs, `run_as`):
+        // two calls waiting on authorization would raise two dialogs.
         let state_path = state_path.clone();
         tokio::spawn(async move { handle(stream, &state_path).await });
     }
