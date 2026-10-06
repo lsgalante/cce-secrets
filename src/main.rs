@@ -4,7 +4,7 @@ use wayland_client::QueueHandle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey,
-    ScrollMotion, TextBox, WidgetHost, LINE_PX,
+    ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX,
 };
 
 const LIST_W: f32 = 280.0;
@@ -606,6 +606,106 @@ async fn delete_item(
     Ok(())
 }
 
+// ── The entry list's scrollbar ────────────────────────────────────────────
+
+/// Pointer slop either side of the bar's strip, as the toolkit's bars take.
+const BAR_SLOP: f32 = 4.0;
+/// The track stops this far short of each end of the list.
+const BAR_TRACK_INSET: f32 = 4.0;
+/// The shortest thumb, as the toolkit's bars draw it.
+const BAR_MIN_THUMB: f32 = 20.0;
+
+/// The entry list's scrollbar: the DE's one design (cce-ui/CLAUDE.md, "Every
+/// scrollbar rides a centre line, behind the plate") — down the CENTRE of the
+/// list's width, over the rows, pills in the shared track and thumb colours.
+/// Pure geometry, so it is tested without a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ListBar {
+    x: f32,
+    w: f32,
+    track_y: f32,
+    track_h: f32,
+    thumb_y: f32,
+    thumb_h: f32,
+}
+
+impl ListBar {
+    /// The bar for a list at `list` (x, y, w, h) holding `content_h` of rows
+    /// scrolled to `scroll_y`, `w` thick; `None` when nothing overflows.
+    fn of(list: (f32, f32, f32, f32), content_h: f32, scroll_y: f32, w: f32) -> Option<Self> {
+        let (lx, ly, lw, lh) = list;
+        if content_h <= lh || lh <= 0.0 {
+            return None;
+        }
+        let track_y = ly + BAR_TRACK_INSET;
+        let track_h = (lh - 2.0 * BAR_TRACK_INSET).max(0.0);
+        let thumb_h = if track_h <= BAR_MIN_THUMB {
+            track_h
+        } else {
+            (track_h * lh / content_h).clamp(BAR_MIN_THUMB, track_h)
+        };
+        let ratio = (scroll_y / (content_h - lh)).clamp(0.0, 1.0);
+        Some(Self {
+            x: lx + (lw - w) * 0.5,
+            w,
+            track_y,
+            track_h,
+            thumb_y: track_y + ratio * (track_h - thumb_h),
+            thumb_h,
+        })
+    }
+
+    /// The bar's strip, slop included — what a pointer over it means. The
+    /// caller gates presses on the bar being RAISED: a sunk one is behind
+    /// the list's plate and a press on its lane is a press on the row.
+    fn hits(&self, px: f32, py: f32) -> bool {
+        px >= self.x - BAR_SLOP
+            && px <= self.x + self.w + BAR_SLOP
+            && py >= self.track_y
+            && py <= self.track_y + self.track_h
+    }
+
+    fn on_thumb(&self, py: f32) -> bool {
+        py >= self.thumb_y && py <= self.thumb_y + self.thumb_h
+    }
+
+    /// The scroll offset that puts the thumb's top at `thumb_top`.
+    fn scroll_for(&self, thumb_top: f32, max_scroll: f32) -> f32 {
+        let span = self.track_h - self.thumb_h;
+        if span <= 0.0 {
+            return 0.0;
+        }
+        ((thumb_top - self.track_y) / span).clamp(0.0, 1.0) * max_scroll
+    }
+
+    /// Track then thumb, as pills, their colours' alpha scaled by `alpha`:
+    /// 1 for the idle copy under the list's plate, the activity's fade for
+    /// the fore copy over the rows.
+    fn paint(&self, pc: &mut cce_ui::scene::paint::PaintCtx, alpha: f32) {
+        use cce_ui::scene::layout::Rect;
+        let a = alpha.clamp(0.0, 1.0);
+        if a <= 0.001 {
+            return;
+        }
+        let dim = |mut c: [f32; 4]| {
+            c[3] *= a;
+            c
+        };
+        let all = (true, true, true, true);
+        let track = Rect { x: self.x, y: self.track_y, width: self.w, height: self.track_h };
+        pc.rounded_rect(track, self.w.min(self.track_h) * 0.5, all, dim(cce_ui::color::scrollbar_track_color()));
+        let thumb = Rect { x: self.x, y: self.thumb_y, width: self.w, height: self.thumb_h };
+        pc.rounded_rect(thumb, self.w.min(self.thumb_h) * 0.5, all, dim(cce_ui::color::scrollbar_thumb_color()));
+    }
+}
+
+/// One frame of the bar's raise/sink: true while the frame loop must keep
+/// drawing — the latch flipped, the fade is moving, or the hold is still
+/// running (the sink has to be ticked to, or a still list never sinks).
+fn tick_bar(activity: &mut ScrollbarActivity, dt: f32, overflowing: bool, dragging: bool) -> bool {
+    activity.tick(dt, overflowing, dragging) || activity.holding()
+}
+
 // ── Application ───────────────────────────────────────────────────────────
 
 struct SecretsApp {
@@ -648,6 +748,11 @@ struct SecretsApp {
     /// by the motion on its next step.
     scroll_y: f32,
     scroll_motion: ScrollMotion,
+    /// The list's scrollbar idles behind the list's plate and a scroll
+    /// raises it ([`ListBar`]); this is its hold and fade.
+    bar_activity: ScrollbarActivity,
+    /// A thumb drag in progress: the pointer's offset from the thumb's top.
+    bar_grab: Option<f32>,
     /// List viewport (x, y, w, h), refreshed each paint for hit-testing.
     list_rect: (f32, f32, f32, f32),
     pointer: (f32, f32),
@@ -710,6 +815,24 @@ impl SecretsApp {
         (self.filtered().len() as f32 * ROW_H - self.list_rect.3).max(0.0)
     }
 
+    /// The list's scrollbar as it stands, `None` while nothing overflows.
+    fn list_scrollbar(&self) -> Option<ListBar> {
+        ListBar::of(
+            self.list_rect,
+            self.filtered().len() as f32 * ROW_H,
+            self.scroll_y,
+            cce_ui::layout::centred_scrollbar_width(),
+        )
+    }
+
+    /// A direct write to `scroll_y` (a clamp, the Escape reset) is a scroll
+    /// like any other: if it moved the list, the bar comes up.
+    fn note_scroll_from(&mut self, before: f32) {
+        if (self.scroll_y - before).abs() > 1e-3 {
+            self.bar_activity.bump();
+        }
+    }
+
     /// Advance the wheel glide / flick coast; true while the offset is moving
     /// (the frame loop keeps drawing). Hover follows the rows under the pointer.
     fn tick_scroll(&mut self, dt: f32) -> bool {
@@ -720,6 +843,8 @@ impl SecretsApp {
         let moved = self.scroll_motion.tick(dt, Bounds::max(0.0), Bounds::max(self.max_scroll()));
         self.scroll_y = self.scroll_motion.y.pos();
         if moved {
+            // A glide or coast in motion keeps the bar raised.
+            self.bar_activity.bump();
             self.hover_row = self.row_at(self.pointer.0, self.pointer.1);
         }
         moved || self.scroll_motion.is_animating()
@@ -975,6 +1100,8 @@ impl Application for SecretsApp {
             otp_drawn_left: 0,
             scroll_y: 0.0,
             scroll_motion: ScrollMotion::new(),
+            bar_activity: ScrollbarActivity::new(),
+            bar_grab: None,
             // Placed by the first frame; empty until then so nothing hit-tests.
             list_rect: (0.0, 0.0, 0.0, 0.0),
             pointer: (0.0, 0.0),
@@ -1018,7 +1145,9 @@ impl Application for SecretsApp {
                 if self.selected_entry().is_none() {
                     self.selected = None;
                 }
+                let before = self.scroll_y;
                 self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+                self.note_scroll_from(before);
                 if self.syncing {
                     return;
                 }
@@ -1142,6 +1271,10 @@ impl Application for SecretsApp {
         if self.tick_scroll(dt) {
             *needs_rebuild = true;
         }
+        let overflowing = self.filtered().len() as f32 * ROW_H > self.list_rect.3;
+        if tick_bar(&mut self.bar_activity, dt, overflowing, self.bar_grab.is_some()) {
+            *needs_rebuild = true;
+        }
         if self.ensure_otp() {
             *needs_rebuild = true;
         }
@@ -1228,6 +1361,13 @@ impl Application for SecretsApp {
         let list_y = inset + SEARCH_H + gap;
         let list_h = (sh - list_y - STATUS_H - gap).max(0.0);
         self.list_rect = (inset, list_y, LIST_W, list_h);
+        // The scrollbar's idle copy, at full alpha UNDER the list's
+        // translucent plate, every frame — raised or not, since the fore copy
+        // fades in over it and dropping this at the latch would blink the bar.
+        let bar = self.list_scrollbar();
+        if let Some(bar) = bar {
+            bar.paint(&mut pc, 1.0);
+        }
         quad(&mut pc, inset, list_y, LIST_W, list_h, cce_ui::color::list_bg_color());
 
         let filtered = self.filtered();
@@ -1268,19 +1408,10 @@ impl Application for SecretsApp {
             }
         }
 
-        // Scrollbar (wheel-driven; thumb is display-only).
-        let content_h = filtered.len() as f32 * ROW_H;
-        if content_h > list_h {
-            let sb_w = 4.0;
-            // style: deliberate — the 4px thumb hugs the list's rim; a rung-wide
-            // gutter would read as a column of its own.
-            let sb_x = inset + LIST_W - sb_w - 3.0;
-            let visible_ratio = list_h / content_h;
-            let thumb_h = (list_h * visible_ratio).clamp(20.0, list_h);
-            let scroll_ratio = if self.max_scroll() > 0.0 { self.scroll_y / self.max_scroll() } else { 0.0 };
-            let thumb_y = list_y + scroll_ratio * (list_h - thumb_h);
-            quad(&mut pc, sb_x, list_y, sb_w, list_h, cce_ui::color::scrollbar_track_color());
-            quad(&mut pc, sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color());
+        // The scrollbar's fore copy, over the rows at the activity's fade:
+        // a scroll raises it out of the plate, and it sinks back once idle.
+        if let Some(bar) = bar {
+            bar.paint(&mut pc, self.bar_activity.fade());
         }
 
         // ── Right panel: detail view or the entry form ──
@@ -1423,6 +1554,17 @@ impl Application for SecretsApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
         self.pointer = (pos.x, pos.y);
+        let bar = self.list_scrollbar();
+        // Hover only SUSTAINS a raised bar; the activity ignores it on a sunk one.
+        self.bar_activity.set_hover(bar.is_some_and(|b| b.hits(pos.x, pos.y)));
+        if let (Some(grab), Some(bar)) = (self.bar_grab, bar) {
+            let before = self.scroll_y;
+            self.scroll_y = bar.scroll_for(pos.y - grab, self.max_scroll());
+            self.scroll_motion.y.jump_to(self.scroll_y);
+            if (self.scroll_y - before).abs() > 1e-3 {
+                *needs_rebuild = true;
+            }
+        }
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let mut roots = vec![self.search_box.id()];
         roots.extend(self.buttons_mut().map(|b| b.id()));
@@ -1448,6 +1590,13 @@ impl Application for SecretsApp {
     ) -> Option<Self::Message> {
         let (lx, ly) = (pos.x, pos.y);
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: lx, y: ly, local_x: lx, local_y: ly };
+
+        // A thumb drag ends wherever the button comes up; the release
+        // refreshes the hold, as a scroll does.
+        if button == MouseButton::Left && state == ElementState::Released && self.bar_grab.take().is_some() {
+            self.bar_activity.bump();
+            *needs_rebuild = true;
+        }
 
         // Buttons: propagate, then drain clicks into messages.
         let button_roots: Vec<_> = {
@@ -1523,6 +1672,22 @@ impl Application for SecretsApp {
             }
         }
 
+        // The scrollbar takes a press only while RAISED: sunk, it is behind
+        // the list's plate and the press is the row's. On the thumb it grabs
+        // where it was pressed; on the track the thumb jumps under the pointer.
+        if button == MouseButton::Left && state == ElementState::Pressed && self.bar_activity.raised() {
+            if let Some(bar) = self.list_scrollbar().filter(|b| b.hits(lx, ly)) {
+                let grab = if bar.on_thumb(ly) { ly - bar.thumb_y } else { bar.thumb_h * 0.5 };
+                self.bar_grab = Some(grab);
+                self.scroll_y = bar.scroll_for(ly - grab, self.max_scroll());
+                self.scroll_motion.y.jump_to(self.scroll_y);
+                self.bar_activity.bump();
+                self.hover_row = self.row_at(lx, ly);
+                *needs_rebuild = true;
+                return None;
+            }
+        }
+
         // List selection only while browsing — the form keeps its state.
         if !self.editing() && button == MouseButton::Left && state == ElementState::Pressed {
             if let Some(row) = self.row_at(lx, ly) {
@@ -1547,6 +1712,8 @@ impl Application for SecretsApp {
         self.scroll_motion.reconcile(0.0, self.scroll_y);
         let moved = self.scroll_motion.apply(delta, (LINE_PX, LINE_PX), Bounds::max(0.0), Bounds::max(self.max_scroll()));
         self.scroll_y = self.scroll_motion.y.pos();
+        // A wheel raises the bar, even one that meets the end of the list.
+        self.bar_activity.bump();
         if moved {
             self.hover_row = self.row_at(self.pointer.0, self.pointer.1);
             *needs_rebuild = true;
@@ -1565,7 +1732,9 @@ impl Application for SecretsApp {
                         self.search_box.text.clear();
                         self.search_box.edit_buffer.clear();
                         self.search_box.unfocus();
+                        let before = self.scroll_y;
                         self.scroll_y = 0.0;
+                        self.note_scroll_from(before);
                         *needs_rebuild = true;
                         return None;
                     }
@@ -1608,7 +1777,9 @@ impl Application for SecretsApp {
                 *needs_rebuild = true;
             }
         }
+        let before = self.scroll_y;
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+        self.note_scroll_from(before);
         None
     }
 }
@@ -1651,6 +1822,66 @@ mod tests {
         assert!(!merged.contains_key("URL"), "a cleared field is removed");
         assert_eq!(merged.get("Notes").map(String::as_str), Some("keep me"));
         assert_eq!(merged.len(), 5);
+    }
+
+    #[test]
+    fn the_list_bar_rides_the_centre_line_and_only_when_it_overflows() {
+        let list = (10.0, 100.0, 280.0, 200.0);
+        assert_eq!(ListBar::of(list, 200.0, 0.0, 6.0), None, "nothing to scroll, no bar");
+
+        // 800 px of rows in a 200 px list.
+        let top = ListBar::of(list, 800.0, 0.0, 6.0).unwrap();
+        assert!((top.x + top.w * 0.5 - (10.0 + 140.0)).abs() < 1e-4, "down the list's centre line");
+        assert_eq!((top.track_y, top.track_h), (104.0, 192.0), "the track stops 4 px short of each end");
+        assert!((top.thumb_h - 48.0).abs() < 1e-4, "a quarter of the rows is a quarter of the track");
+        assert_eq!(top.thumb_y, top.track_y);
+
+        let end = ListBar::of(list, 800.0, 600.0, 6.0).unwrap();
+        assert!((end.thumb_y + end.thumb_h - (end.track_y + end.track_h)).abs() < 1e-4, "scrolled to the end");
+        assert!((end.scroll_for(end.thumb_y, 600.0) - 600.0).abs() < 1e-3);
+        assert!((top.scroll_for(top.thumb_y, 600.0)).abs() < 1e-3);
+
+        // A long list keeps the toolkit's shortest thumb.
+        let long = ListBar::of(list, 100_000.0, 0.0, 6.0).unwrap();
+        assert_eq!(long.thumb_h, BAR_MIN_THUMB);
+
+        // The strip with its slop, and nothing past the track's ends.
+        assert!(top.hits(top.x - BAR_SLOP, 150.0));
+        assert!(top.hits(top.x + top.w + BAR_SLOP, 150.0));
+        assert!(!top.hits(top.x - BAR_SLOP - 1.0, 150.0));
+        assert!(!top.hits(top.x + 1.0, top.track_y - 1.0));
+    }
+
+    #[test]
+    fn the_list_bar_keeps_frames_coming_until_it_has_sunk() {
+        let mut a = ScrollbarActivity::new();
+        // Hover never raises a sunk bar.
+        a.set_hover(true);
+        assert!(!tick_bar(&mut a, 0.016, true, false));
+        assert!(!a.raised());
+        a.set_hover(false);
+
+        // A scroll raises it, and frames keep coming until the sink has
+        // faded all the way out — then they stop.
+        a.bump();
+        let mut frames = 0;
+        while tick_bar(&mut a, 0.016, true, false) {
+            frames += 1;
+            assert!(frames < 1000, "the bar never settled");
+        }
+        assert!(frames > 0);
+        assert!(!a.raised());
+        assert_eq!(a.fade(), 0.0);
+
+        // A pointer over a RAISED bar holds it up past the hold.
+        a.bump();
+        tick_bar(&mut a, 0.016, true, false);
+        assert!(a.raised());
+        a.set_hover(true);
+        for _ in 0..200 {
+            tick_bar(&mut a, 0.016, true, false);
+        }
+        assert!(a.raised(), "hover sustains a raised bar");
     }
 
     #[test]
