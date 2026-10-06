@@ -9,10 +9,8 @@ use cce_ui::widget::{
 
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
-const SEARCH_H: f32 = 30.0;
 const STATUS_H: f32 = 30.0;
 const BTN_W: f32 = 90.0;
-const BTN_H: f32 = 28.0;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 
 /// Entry fields written back as Secret Service attributes (cce-keyring-sync
@@ -1052,7 +1050,7 @@ impl SecretsApp {
 }
 
 fn park(btn: &mut cce_ui::widget::Adapted<Button>) {
-    btn.set_rect(-1000.0, -1000.0, BTN_W, BTN_H);
+    btn.set_rect(-1000.0, -1000.0, BTN_W, cce_ui::layout::button_height());
 }
 
 fn srgb_u8(linear: [f32; 4]) -> [u8; 3] {
@@ -1075,16 +1073,16 @@ impl Application for SecretsApp {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         Self {
             search_box: TextBox::new(String::new()).with_placeholder("Search"),
-            refresh_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Refresh"),
-            sync_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Sync"),
-            new_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("New"),
-            reveal_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Reveal"),
-            copy_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Copy"),
-            otp_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Copy code"),
-            edit_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Edit"),
-            delete_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Delete"),
-            save_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Save"),
-            cancel_btn: Button::new(0.0, 0.0, BTN_W, BTN_H).with_label("Cancel"),
+            refresh_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Refresh"),
+            sync_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Sync"),
+            new_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("New"),
+            reveal_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Reveal"),
+            copy_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy"),
+            otp_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy code"),
+            edit_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Edit"),
+            delete_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Delete"),
+            save_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Save"),
+            cancel_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Cancel"),
             title_box: TextBox::new(String::new()).with_placeholder("title"),
             user_box: TextBox::new(String::new()).with_placeholder("username"),
             url_box: TextBox::new(String::new()).with_placeholder("url"),
@@ -1351,14 +1349,17 @@ impl Application for SecretsApp {
         let gap = cce_ui::layout::root_plate_gap();
         let pad = cce_ui::layout::plate_padding();
         let pgap = cce_ui::layout::plate_gap();
+        let btn_h = cce_ui::layout::button_height();
+        let box_h = cce_ui::layout::textbox_height();
 
         // ── Left panel: search + entry list ──
-        self.search_box.set_rect(inset, inset, LIST_W, SEARCH_H);
-        self.refresh_btn.set_rect(sw - inset - BTN_W, inset, BTN_W, BTN_H);
-        self.new_btn.set_rect(sw - inset - BTN_W * 2.0 - gap, inset, BTN_W, BTN_H);
-        self.sync_btn.set_rect(sw - inset - BTN_W * 3.0 - 2.0 * gap, inset, BTN_W, BTN_H);
+        self.search_box.set_rect(inset, inset, LIST_W, box_h);
+        self.refresh_btn.set_rect(sw - inset - BTN_W, inset, BTN_W, btn_h);
+        self.new_btn.set_rect(sw - inset - BTN_W * 2.0 - gap, inset, BTN_W, btn_h);
+        self.sync_btn.set_rect(sw - inset - BTN_W * 3.0 - 2.0 * gap, inset, BTN_W, btn_h);
 
-        let list_y = inset + SEARCH_H + gap;
+        // Below the taller of the search box and the button row beside it.
+        let list_y = inset + box_h.max(btn_h) + gap;
         let list_h = (sh - list_y - STATUS_H - gap).max(0.0);
         self.list_rect = (inset, list_y, LIST_W, list_h);
         // The scrollbar's idle copy, at full alpha UNDER the list's
@@ -1428,16 +1429,16 @@ impl Application for SecretsApp {
                 let labels = ["Title", "UserName", "URL", "Notes", "Password"];
                 let mut fy = hy + 22.0 + pgap;
                 let box_w = (dw - 4.0).min(320.0); // TODO(style): 4px slack on the field width, not a rung
-                // Each field is a 10px label strip (14.0) over a 28px box. The
+                // Each field is a 10px label strip (14.0) over a textbox. The
                 // fields are `pgap` apart rather than `control_gap()`: five
                 // control-height gaps overrun the default window height.
                 for (label, tb) in labels.iter().zip(self.form_boxes_mut()) {
-                    tb.set_rect(dx, fy + 14.0, box_w, 28.0);
+                    tb.set_rect(dx, fy + 14.0, box_w, box_h);
                     pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, None);
-                    fy += 14.0 + 28.0 + pgap;
+                    fy += 14.0 + box_h + pgap;
                 }
-                self.save_btn.set_rect(dx, fy, BTN_W, BTN_H);
-                self.cancel_btn.set_rect(dx + BTN_W + pgap, fy, BTN_W, BTN_H);
+                self.save_btn.set_rect(dx, fy, BTN_W, btn_h);
+                self.cancel_btn.set_rect(dx + BTN_W + pgap, fy, BTN_W, btn_h);
                 for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.otp_btn, &mut self.edit_btn, &mut self.delete_btn, &mut self.new_btn] {
                     park(b);
                 }
@@ -1483,18 +1484,18 @@ impl Application for SecretsApp {
                     );
                     // Two button rows under the secret line (14.0, its advance).
                     let by = ay + 14.0 + pgap;
-                    self.reveal_btn.set_rect(dx, by, BTN_W, BTN_H);
-                    self.copy_btn.set_rect(dx + BTN_W + pgap, by, BTN_W, BTN_H);
-                    self.edit_btn.set_rect(dx, by + BTN_H + pgap, BTN_W, BTN_H);
-                    self.delete_btn.set_rect(dx + BTN_W + pgap, by + BTN_H + pgap, BTN_W, BTN_H);
+                    self.reveal_btn.set_rect(dx, by, BTN_W, btn_h);
+                    self.copy_btn.set_rect(dx + BTN_W + pgap, by, BTN_W, btn_h);
+                    self.edit_btn.set_rect(dx, by + btn_h + pgap, BTN_W, btn_h);
+                    self.delete_btn.set_rect(dx + BTN_W + pgap, by + btn_h + pgap, BTN_W, btn_h);
                     // Copy code ends the first row when the pane is wide
                     // enough, else opens a third.
                     if otp.is_some() {
                         let third = dx + 2.0 * (BTN_W + pgap);
                         if third + BTN_W <= dx + dw {
-                            self.otp_btn.set_rect(third, by, BTN_W, BTN_H);
+                            self.otp_btn.set_rect(third, by, BTN_W, btn_h);
                         } else {
-                            self.otp_btn.set_rect(dx, by + 2.0 * (BTN_H + pgap), BTN_W, BTN_H);
+                            self.otp_btn.set_rect(dx, by + 2.0 * (btn_h + pgap), BTN_W, btn_h);
                         }
                     } else {
                         park(&mut self.otp_btn);
