@@ -9,8 +9,13 @@
 //! 1Password records item history on every edit.
 //!
 //! Change detection on the remote side is by `updated_at`: an entry whose
-//! timestamp still equals the base's is unchanged and never fetched, so a
-//! quiet tick is one `op item list` and no secrets.
+//! timestamp still equals the base's is unchanged and never fetched. The
+//! keyring side does the same by `Modified`, which gnome-keyring bumps on
+//! every label, attribute and secret edit and leaves alone on a read
+//! (measured 2026-10-06): an item whose time still equals the base's is not
+//! read past its attributes. So a quiet tick is one `op item list`, two
+//! keyring calls per item, and no secrets — until 2026-10-06 it read and
+//! decrypted every password (~1,500 calls for 379 items) to find nothing.
 
 use std::collections::HashMap;
 
@@ -141,7 +146,53 @@ fn keyring_attrs<'a>(k: &'a KrEntry, id: &'a str, extra: &'a HashMap<String, Str
 struct Local<'a> {
     item: secret_service::Item<'a>,
     attrs: HashMap<String, String>,
-    entry: KrEntry,
+    modified: u64,
+    /// The item's synced fields, or `None` when its `Modified` still equals
+    /// the base's: unchanged since the last sync, so its hash is the base's
+    /// and its label and secret were never read. Every plan that writes
+    /// keyring fields elsewhere reads them first ([`ensure_read`]).
+    entry: Option<KrEntry>,
+}
+
+/// Whether a keyring item can stand on its base unread: it has one, and its
+/// `Modified` is the one the base recorded. A zero time is never trusted —
+/// it is what a failed read once defaulted to.
+fn unchanged_since_base(base: Option<&EntryState>, modified: u64) -> bool {
+    base.is_some_and(|b| modified != 0 && b.keyring_modified == modified)
+}
+
+/// Read an item's synced fields. Any failure stops the pass (see the
+/// snapshot below): a read that could not be answered never stands in as
+/// an empty value.
+async fn read_entry(
+    item: &secret_service::Item<'_>,
+    attrs: &HashMap<String, String>,
+    modified: u64,
+    vault: &str,
+) -> Result<KrEntry, String> {
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        let which = attrs.get(OP_ITEM_ATTR).map(String::as_str).unwrap_or("an unpaired item");
+        format!("reading the {what} of {which} failed: {e}; nothing synced this pass")
+    };
+    let title = item.get_label().await.map_err(|e| unreadable("title", &e))?;
+    let secret = item.get_secret().await.map_err(|e| unreadable("password", &e))?;
+    Ok(KrEntry {
+        title,
+        username: attrs.get("UserName").cloned().unwrap_or_default(),
+        password: String::from_utf8_lossy(&secret).into_owned(),
+        url: attrs.get("URL").cloned().unwrap_or_default(),
+        notes: attrs.get("Notes").cloned().unwrap_or_default(),
+        group: attrs.get(OP_VAULT_ATTR).cloned().unwrap_or_else(|| vault.to_string()),
+        modified,
+    })
+}
+
+/// A local item's fields, reading them now if the snapshot skipped them.
+async fn ensure_read(l: &mut Local<'_>, vault: &str) -> Result<(), String> {
+    if l.entry.is_none() {
+        l.entry = Some(read_entry(&l.item, &l.attrs, l.modified, vault).await?);
+    }
+    Ok(())
 }
 
 /// One merge pass. Always writes the state file on a real run (with
@@ -217,28 +268,19 @@ pub async fn sync_remote<I: Interchange>(
         if id.is_none() && !attrs.contains_key("UserName") && !attrs.contains_key("kdbx-uuid") {
             continue; // some other app's item — never ours to sync
         }
-        let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        let modified = item.get_modified().await.map_err(|e| {
             let which = attrs.get(OP_ITEM_ATTR).map(String::as_str).unwrap_or("an unpaired item");
-            format!("reading the {what} of {which} failed: {e}; nothing synced this pass")
-        };
-        let title = item.get_label().await.map_err(|e| unreadable("title", &e))?;
-        let secret = item.get_secret().await.map_err(|e| unreadable("password", &e))?;
-        let modified = item.get_modified().await.map_err(|e| unreadable("modified time", &e))?;
-        let entry = KrEntry {
-            title,
-            username: attrs.get("UserName").cloned().unwrap_or_default(),
-            password: String::from_utf8_lossy(&secret).into_owned(),
-            url: attrs.get("URL").cloned().unwrap_or_default(),
-            notes: attrs.get("Notes").cloned().unwrap_or_default(),
-            group: attrs.get(OP_VAULT_ATTR).cloned().unwrap_or_else(|| vault.clone()),
-            modified,
-        };
-        let local = Local { item, attrs, entry };
+            format!("reading the modified time of {which} failed: {e}; nothing synced this pass")
+        })?;
+        // Unchanged since the base: the label and the secret are not read.
+        let unchanged = unchanged_since_base(id.as_ref().and_then(|id| state.entries.get(id)), modified);
+        let entry = if unchanged { None } else { Some(read_entry(&item, &attrs, modified, &vault).await?) };
+        let local = Local { item, attrs, modified, entry };
         match id {
             Some(id) => {
                 // Two items with one stamp (a tool that re-created rather than
                 // edited): the newer one is the person's latest word.
-                let newer = kr.get(&id).is_none_or(|old| local.entry.modified >= old.entry.modified);
+                let newer = kr.get(&id).is_none_or(|old| local.modified >= old.modified);
                 if newer {
                     kr.insert(id, local);
                 }
@@ -267,7 +309,14 @@ pub async fn sync_remote<I: Interchange>(
     let mut plans: Vec<(String, Plan)> = Vec::new();
     for id in &ids {
         let base = state.entries.get(id);
-        let k_side = kr.get(id).map(|l| Side { hash: l.entry.hash(&hash_key), time: l.entry.modified as i64 });
+        let k_side = kr.get(id).map(|l| Side {
+            hash: match &l.entry {
+                Some(e) => e.hash(&hash_key),
+                // Not read: unchanged since the base, which is what it hashed to.
+                None => base.map(|b| b.h.clone()).unwrap_or_default(),
+            },
+            time: l.modified as i64,
+        });
         let r_side = match rs.get(id) {
             None => None,
             Some(s) => {
@@ -286,11 +335,23 @@ pub async fn sync_remote<I: Interchange>(
         plans.push((id.clone(), plan(base.map(|b| b.h.as_str()), r_side.as_ref(), k_side.as_ref())));
     }
 
+    // The plans that copy keyring fields out need them read. An item left
+    // unread hashes to its base, so these never pick one — but the fields
+    // are read rather than trusted to that.
+    for (id, p) in &plans {
+        if matches!(p, Plan::ToRemote | Plan::ConflictKeyringWins | Plan::CreateRemote) {
+            if let Some(l) = kr.get_mut(id) {
+                ensure_read(l, &vault).await?;
+            }
+        }
+    }
+    let kr = kr;
+
     // ---- report ----
     let title_of = |id: &str| -> String {
         rs.get(id)
             .map(|s| s.title.clone())
-            .or_else(|| kr.get(id).map(|l| l.entry.title.clone()))
+            .or_else(|| kr.get(id).and_then(|l| l.entry.as_ref()).map(|e| e.title.clone()))
             .unwrap_or_else(|| id.to_string())
     };
     let mut journal = String::new();
@@ -319,9 +380,11 @@ pub async fn sync_remote<I: Interchange>(
         println!("  {verb}: {}", title_of(id));
         journal.push_str(&format!("{} sync {verb}: {}\n", now_unix(), title_of(id)));
     }
+    let full = |l: &Local<'_>| -> KrEntry { l.entry.clone().expect("read before the plan used it") };
     for l in &born {
-        println!("  create in 1Password: {}", l.entry.title);
-        journal.push_str(&format!("{} sync create in 1Password: {}\n", now_unix(), l.entry.title));
+        let title = &l.entry.as_ref().expect("born items are always read").title;
+        println!("  create in 1Password: {title}");
+        journal.push_str(&format!("{} sync create in 1Password: {title}\n", now_unix()));
         *counts.entry("created").or_default() += 1;
     }
     let c = |k: &str| counts.get(k).copied().unwrap_or(0);
@@ -377,6 +440,14 @@ pub async fn sync_remote<I: Interchange>(
                         b.op_updated_at = s.updated_raw.clone();
                     }
                 }
+                // The keyring's time likewise: an item that was read (its
+                // time moved) yet hashes to the base was touched without a
+                // change. Recording the time lets the next pass skip it.
+                if let (Some(l), Some(b)) = (kr.get(id), next.get_mut(id)) {
+                    if l.entry.is_some() && b.keyring_modified != l.modified {
+                        b.keyring_modified = l.modified;
+                    }
+                }
             }
             Plan::Forget => {
                 next.remove(id);
@@ -430,11 +501,11 @@ pub async fn sync_remote<I: Interchange>(
                 applied += 1;
             }
             Plan::ToRemote | Plan::ConflictKeyringWins => {
-                let l = &kr[id];
-                let e = kr_to_remote(&l.entry, id, &l.entry.group);
+                let k = full(&kr[id]);
+                let e = kr_to_remote(&k, id, &k.group);
                 match remote.update(&e).await {
                     Ok(updated_raw) => {
-                        next.insert(id.clone(), snapshot(&l.entry, updated_raw, l.entry.modified));
+                        next.insert(id.clone(), snapshot(&k, updated_raw, k.modified));
                         applied += 1;
                     }
                     Err(err) => {
@@ -447,11 +518,12 @@ pub async fn sync_remote<I: Interchange>(
                 // A keyring entry whose stamp points at nothing any more
                 // (archived remotely, edited locally): create afresh, restamp.
                 let l = &kr[id];
-                let mut e = kr_to_remote(&l.entry, "", &vault);
+                let entry = full(l);
+                let mut e = kr_to_remote(&entry, "", &vault);
                 e.vault = vault.clone();
                 match remote.create(&e).await {
                     Ok((new_id, updated_raw)) => {
-                        let mut k = l.entry.clone();
+                        let mut k = entry.clone();
                         k.group = vault.clone();
                         let attrs = keyring_attrs(&k, &new_id, &l.attrs);
                         let modified = match async {
@@ -463,7 +535,7 @@ pub async fn sync_remote<I: Interchange>(
                             Ok(m) => m,
                             Err(err) => {
                                 eprintln!("  could not restamp {}: {err}", k.title);
-                                l.entry.modified
+                                entry.modified
                             }
                         };
                         next.remove(id);
@@ -483,7 +555,7 @@ pub async fn sync_remote<I: Interchange>(
                         next.remove(id);
                         applied += 1;
                     }
-                    Err(err) => eprintln!("  keyring delete failed for {}: {err}", l.entry.title),
+                    Err(err) => eprintln!("  keyring delete failed for {}: {err}", title_of(id)),
                 }
             }
             Plan::RecycleRemote => match remote.recycle(id).await {
@@ -500,7 +572,7 @@ pub async fn sync_remote<I: Interchange>(
     }
     if failure.is_none() {
         for l in &born {
-            let mut k = l.entry.clone();
+            let mut k = full(l);
             k.group = vault.clone();
             let e = kr_to_remote(&k, "", &vault);
             match remote.create(&e).await {
@@ -515,7 +587,7 @@ pub async fn sync_remote<I: Interchange>(
                         Ok(m) => m,
                         Err(err) => {
                             eprintln!("  could not stamp {}: {err}", k.title);
-                            l.entry.modified
+                            l.modified
                         }
                     };
                     next.insert(new_id, snapshot(&k, updated_raw, modified));
@@ -608,6 +680,16 @@ mod tests {
     fn a_stamped_entry_without_a_base_is_reconciled_by_hash() {
         assert_eq!(plan(None, Some(&side("X", 0)), Some(&side("X", 0))), Plan::InSync);
         assert_eq!(plan(None, Some(&side("R", 10)), Some(&side("K", 0))), Plan::ConflictRemoteWins);
+    }
+
+    #[test]
+    fn an_item_is_skipped_only_at_its_base_time() {
+        let base = EntryState { h: "B".into(), keyring_modified: 1_790_000_000, op_updated_at: String::new() };
+        assert!(unchanged_since_base(Some(&base), 1_790_000_000));
+        assert!(!unchanged_since_base(Some(&base), 1_790_000_001), "edited since: read it");
+        assert!(!unchanged_since_base(None, 1_790_000_000), "no base: read it");
+        let zero = EntryState { keyring_modified: 0, ..base };
+        assert!(!unchanged_since_base(Some(&zero), 0), "a zero time proves nothing");
     }
 
     #[test]

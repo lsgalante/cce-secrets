@@ -280,6 +280,15 @@ goes on argv** (argv is readable by every same-user process via
 a quiet run is one `op` process and a few hundred bytes of JSON. That also
 keeps the timer's steady state from touching a single secret.
 
+The keyring side matches it by `Modified`, which gnome-keyring bumps on a
+label, attribute or secret edit and leaves alone on a read (measured
+2026-10-06): an item still at the base's time is read for its attributes
+and time only, never its label or secret. Until then every pass read and
+decrypted all of them — 1,523 Secret Service calls and 380 `GetSecret`s
+for 379 items, measured in an isolated keyring; now 765 calls and one
+`GetSecret` (the state hash key), and gnome-keyring's share of a pass
+halves.
+
 ## Pairing and field mapping
 
 Same table as the kdbx, with the id attribute renamed:
