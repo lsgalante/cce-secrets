@@ -1566,6 +1566,14 @@ impl Application for SecretsApp {
                 *needs_rebuild = true;
             }
         }
+        // The shared context menu (a text box's) gets the pointer to itself
+        // while open: its row highlight.
+        if cce_ui::widget::context_menu::is_visible() {
+            if cce_ui::widget::context_menu::cursor_moved(pos.x, pos.y) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let mut roots = vec![self.search_box.id()];
         roots.extend(self.buttons_mut().map(|b| b.id()));
@@ -1597,6 +1605,18 @@ impl Application for SecretsApp {
         if button == MouseButton::Left && state == ElementState::Released && self.bar_grab.take().is_some() {
             self.bar_activity.bump();
             *needs_rebuild = true;
+        }
+
+        // The shared context menu a right-click on a text box opens takes every
+        // click while open (after the release above, so a thumb drag still
+        // ends): a row runs, a press anywhere else dismisses it. The toolkit
+        // leaves this routing to the app; without it the menu could not be
+        // closed by clicking outside it, and its rows did nothing.
+        if cce_ui::widget::context_menu::is_visible() {
+            if cce_ui::widget::context_menu::mouse_input(button, state, lx, ly, Some(&mut self.ui_context)) {
+                *needs_rebuild = true;
+            }
+            return None;
         }
 
         // Buttons: propagate, then drain clicks into messages.
