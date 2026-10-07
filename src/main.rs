@@ -1296,40 +1296,24 @@ impl Application for SecretsApp {
         // Widget roots re-registered every frame (idempotent; the frame is
         // assembled by hand, so nothing else registers them).
         {
-            let (id, ptr) = (self.search_box.id(), self.search_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
+            self.ui_context.register_host(&mut self.search_box);
             {
-                let (id, ptr) = (self.sync_btn.id(), self.sync_btn.as_ptr_mut());
-                self.ui_context.register_widget(id, ptr);
+                self.ui_context.register_host(&mut self.sync_btn);
             }
-            let (id, ptr) = (self.refresh_btn.id(), self.refresh_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.new_btn.id(), self.new_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.reveal_btn.id(), self.reveal_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.copy_btn.id(), self.copy_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.otp_btn.id(), self.otp_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.edit_btn.id(), self.edit_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.delete_btn.id(), self.delete_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.save_btn.id(), self.save_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.cancel_btn.id(), self.cancel_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.title_box.id(), self.title_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.user_box.id(), self.user_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.url_box.id(), self.url_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.notes_box.id(), self.notes_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.pass_box.id(), self.pass_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
+            self.ui_context.register_host(&mut self.refresh_btn);
+            self.ui_context.register_host(&mut self.new_btn);
+            self.ui_context.register_host(&mut self.reveal_btn);
+            self.ui_context.register_host(&mut self.copy_btn);
+            self.ui_context.register_host(&mut self.otp_btn);
+            self.ui_context.register_host(&mut self.edit_btn);
+            self.ui_context.register_host(&mut self.delete_btn);
+            self.ui_context.register_host(&mut self.save_btn);
+            self.ui_context.register_host(&mut self.cancel_btn);
+            self.ui_context.register_host(&mut self.title_box);
+            self.ui_context.register_host(&mut self.user_box);
+            self.ui_context.register_host(&mut self.url_box);
+            self.ui_context.register_host(&mut self.notes_box);
+            self.ui_context.register_host(&mut self.pass_box);
         }
 
         let mut pc = cce_ui::scene::paint::PaintCtx::new();
