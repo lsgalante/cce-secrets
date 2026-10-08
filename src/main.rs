@@ -2,7 +2,7 @@ use secret_service::{EncryptionType, SecretService};
 
 use cce_ui::widget::Owned;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX, WidgetHostExt};
+use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX};
 
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
@@ -1494,15 +1494,12 @@ impl Application for SecretsApp {
         }
 
         // ── Widgets + status line ──
-        for w in &self.widgets_iter() {
-            let (wx, wy, ww, wh) = w.rect();
-            quad(&mut pc, wx, wy, ww, wh, w.color());
-            for (qx, qy, qw, qh, qc) in w.extra_quads() {
-                quad(&mut pc, qx, qy, qw, qh, qc);
-            }
-        }
+        // Each widget as it paints itself — plate, relief, text — through the
+        // toolkit's walk. (Until 2026-10-08 they were drawn through the legacy
+        // tuple views: a flat fill in `color()`, the plain quads, then the
+        // text, so no control here had the relief every other app's has.)
         for w in self.widgets_iter() {
-            cce_ui::scene::painter::append_widget_text(&self.ui_context, w, &mut pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
 
         let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::colors::TEXT_DIM) };
