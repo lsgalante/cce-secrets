@@ -1,5 +1,4 @@
 use secret_service::{EncryptionType, SecretService};
-use wayland_client::QueueHandle;
 
 use cce_ui::widget::Owned;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
@@ -1070,7 +1069,9 @@ impl Application for SecretsApp {
         Some(&self.ui_context)
     }
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         Self {
             search_box: Owned::new(TextBox::new(String::new()).with_placeholder("Search")),
