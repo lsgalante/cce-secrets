@@ -2,10 +2,7 @@ use secret_service::{EncryptionType, SecretService};
 
 use cce_ui::widget::Owned;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::widget::{
-    Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey,
-    ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX,
-};
+use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX, WidgetHostExt};
 
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
