@@ -1,6 +1,7 @@
 use secret_service::{EncryptionType, SecretService};
 use wayland_client::QueueHandle;
 
+use cce_ui::widget::Owned;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey,
@@ -707,23 +708,23 @@ fn tick_bar(activity: &mut ScrollbarActivity, dt: f32, overflowing: bool, draggi
 // ── Application ───────────────────────────────────────────────────────────
 
 struct SecretsApp {
-    search_box: cce_ui::widget::Adapted<TextBox>,
-    refresh_btn: cce_ui::widget::Adapted<Button>,
-    sync_btn: cce_ui::widget::Adapted<Button>,
-    new_btn: cce_ui::widget::Adapted<Button>,
-    reveal_btn: cce_ui::widget::Adapted<Button>,
-    copy_btn: cce_ui::widget::Adapted<Button>,
-    otp_btn: cce_ui::widget::Adapted<Button>,
-    edit_btn: cce_ui::widget::Adapted<Button>,
-    delete_btn: cce_ui::widget::Adapted<Button>,
-    save_btn: cce_ui::widget::Adapted<Button>,
-    cancel_btn: cce_ui::widget::Adapted<Button>,
+    search_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    refresh_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    sync_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    new_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    reveal_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    copy_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    otp_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    edit_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    delete_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    save_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    cancel_btn: Owned<cce_ui::widget::Adapted<Button>>,
     // The entry form, top to bottom (Tab order).
-    title_box: cce_ui::widget::Adapted<TextBox>,
-    user_box: cce_ui::widget::Adapted<TextBox>,
-    url_box: cce_ui::widget::Adapted<TextBox>,
-    notes_box: cce_ui::widget::Adapted<TextBox>,
-    pass_box: cce_ui::widget::Adapted<TextBox>,
+    title_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    user_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    url_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    notes_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    pass_box: Owned<cce_ui::widget::Adapted<TextBox>>,
 
     mode: Mode,
     entries: Vec<EntryData>,
@@ -1072,22 +1073,22 @@ impl Application for SecretsApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         Self {
-            search_box: TextBox::new(String::new()).with_placeholder("Search"),
-            refresh_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Refresh"),
-            sync_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Sync"),
-            new_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("New"),
-            reveal_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Reveal"),
-            copy_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy"),
-            otp_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy code"),
-            edit_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Edit"),
-            delete_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Delete"),
-            save_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Save"),
-            cancel_btn: Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Cancel"),
-            title_box: TextBox::new(String::new()).with_placeholder("title"),
-            user_box: TextBox::new(String::new()).with_placeholder("username"),
-            url_box: TextBox::new(String::new()).with_placeholder("url"),
-            notes_box: TextBox::new(String::new()).with_placeholder("notes"),
-            pass_box: TextBox::new(String::new()).with_password(true).with_placeholder("password"),
+            search_box: Owned::new(TextBox::new(String::new()).with_placeholder("Search")),
+            refresh_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Refresh")),
+            sync_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Sync")),
+            new_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("New")),
+            reveal_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Reveal")),
+            copy_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy")),
+            otp_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy code")),
+            edit_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Edit")),
+            delete_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Delete")),
+            save_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Save")),
+            cancel_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Cancel")),
+            title_box: Owned::new(TextBox::new(String::new()).with_placeholder("title")),
+            user_box: Owned::new(TextBox::new(String::new()).with_placeholder("username")),
+            url_box: Owned::new(TextBox::new(String::new()).with_placeholder("url")),
+            notes_box: Owned::new(TextBox::new(String::new()).with_placeholder("notes")),
+            pass_box: Owned::new(TextBox::new(String::new()).with_password(true).with_placeholder("password")),
             mode: Mode::Browse,
             entries: Vec::new(),
             selected: None,
