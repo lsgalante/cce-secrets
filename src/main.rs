@@ -1,6 +1,6 @@
 use secret_service::{EncryptionType, SecretService};
 
-use cce_ui::widget::Owned;
+use cce_ui::widget::Handle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX};
 
@@ -704,23 +704,23 @@ fn tick_bar(activity: &mut ScrollbarActivity, dt: f32, overflowing: bool, draggi
 // ── Application ───────────────────────────────────────────────────────────
 
 struct SecretsApp {
-    search_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    refresh_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    sync_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    new_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    reveal_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    copy_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    otp_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    edit_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    delete_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    save_btn: Owned<cce_ui::widget::Adapted<Button>>,
-    cancel_btn: Owned<cce_ui::widget::Adapted<Button>>,
+    search_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    refresh_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    sync_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    new_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    reveal_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    copy_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    otp_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    edit_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    delete_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    save_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    cancel_btn: Handle<cce_ui::widget::Adapted<Button>>,
     // The entry form, top to bottom (Tab order).
-    title_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    user_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    url_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    notes_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    pass_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    title_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    user_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    url_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    notes_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    pass_box: Handle<cce_ui::widget::Adapted<TextBox>>,
 
     mode: Mode,
     entries: Vec<EntryData>,
@@ -782,7 +782,7 @@ fn live_text(tb: &cce_ui::widget::Adapted<TextBox>) -> &str {
 impl SecretsApp {
     /// Indices into `entries` matching the search box, in display order.
     fn filtered(&self) -> Vec<usize> {
-        let query = live_text(&self.search_box).to_lowercase();
+        let query = live_text(&self.ui_context[self.search_box]).to_lowercase();
         (0..self.entries.len())
             .filter(|&i| {
                 if query.is_empty() {
@@ -909,13 +909,13 @@ impl SecretsApp {
         changed
     }
 
-    fn form_boxes_mut(&mut self) -> [&mut cce_ui::widget::Adapted<TextBox>; 5] {
+    fn form_boxes(&self) -> [Handle<cce_ui::widget::Adapted<TextBox>>; 5] {
         [
-            &mut self.title_box,
-            &mut self.user_box,
-            &mut self.url_box,
-            &mut self.notes_box,
-            &mut self.pass_box,
+            self.title_box,
+            self.user_box,
+            self.url_box,
+            self.notes_box,
+            self.pass_box,
         ]
     }
 
@@ -925,39 +925,39 @@ impl SecretsApp {
             Some(e) => (e.label.clone(), e.attr("UserName").to_string(), e.attr("URL").to_string(), e.attr("Notes").to_string()),
             None => Default::default(),
         };
-        self.title_box.set_value(&title);
-        self.user_box.set_value(&user);
-        self.url_box.set_value(&url);
-        self.notes_box.set_value(&notes);
-        self.pass_box.set_value("");
-        self.pass_box.placeholder = Some(
+        self.ui_context[self.title_box].set_value(&title);
+        self.ui_context[self.user_box].set_value(&user);
+        self.ui_context[self.url_box].set_value(&url);
+        self.ui_context[self.notes_box].set_value(&notes);
+        self.ui_context[self.pass_box].set_value("");
+        self.ui_context[self.pass_box].placeholder = Some(
             if entry.is_some() { "leave blank to keep current" } else { "password" }.to_string(),
         );
         self.mode = Mode::Edit { path: entry.map(|e| e.path.clone()) };
         self.pending_delete = None;
         self.revealed = None;
-        for b in self.form_boxes_mut() {
-            b.unfocus();
+        for b in self.form_boxes() {
+            self.ui_context[b].unfocus();
         }
-        self.title_box.focus();
+        self.ui_context[self.title_box].focus();
     }
 
     fn close_form(&mut self) {
-        for b in self.form_boxes_mut() {
-            b.unfocus();
+        for b in self.form_boxes() {
+            self.ui_context[b].unfocus();
         }
         self.mode = Mode::Browse;
     }
 
     /// Gather the form into a save command; errors go straight to the status line.
     fn save_form(&mut self) -> Option<Cmd> {
-        let title = live_text(&self.title_box).trim().to_string();
+        let title = live_text(&self.ui_context[self.title_box]).trim().to_string();
         if title.is_empty() {
             self.status_msg = "Title is required".to_string();
             self.status_is_error = true;
             return None;
         }
-        let values = [&self.user_box, &self.url_box, &self.notes_box]
+        let values = [&self.ui_context[self.user_box], &self.ui_context[self.url_box], &self.ui_context[self.notes_box]]
             .map(|b| live_text(b).trim().to_string());
         // Every edited field, empty ones included: an update removes what was
         // cleared (`merge_edited_attributes`); a new item just skips them.
@@ -966,7 +966,7 @@ impl SecretsApp {
             .zip(values)
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        let password = live_text(&self.pass_box).to_string();
+        let password = live_text(&self.ui_context[self.pass_box]).to_string();
         let Mode::Edit { path } = &self.mode else { return None };
         Some(match path {
             Some(path) => Cmd::UpdateItem {
@@ -1009,39 +1009,39 @@ impl SecretsApp {
             .unwrap_or_default();
     }
 
-    fn buttons_mut(&mut self) -> [&mut cce_ui::widget::Adapted<Button>; 10] {
+    fn buttons(&self) -> [Handle<cce_ui::widget::Adapted<Button>>; 10] {
         [
-            &mut self.refresh_btn,
-            &mut self.sync_btn,
-            &mut self.new_btn,
-            &mut self.reveal_btn,
-            &mut self.copy_btn,
-            &mut self.otp_btn,
-            &mut self.edit_btn,
-            &mut self.delete_btn,
-            &mut self.save_btn,
-            &mut self.cancel_btn,
+            self.refresh_btn,
+            self.sync_btn,
+            self.new_btn,
+            self.reveal_btn,
+            self.copy_btn,
+            self.otp_btn,
+            self.edit_btn,
+            self.delete_btn,
+            self.save_btn,
+            self.cancel_btn,
         ]
     }
 
     fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
-            &self.search_box,
-            &self.refresh_btn,
-            &self.sync_btn,
-            &self.new_btn,
-            &self.reveal_btn,
-            &self.copy_btn,
-            &self.otp_btn,
-            &self.edit_btn,
-            &self.delete_btn,
-            &self.save_btn,
-            &self.cancel_btn,
-            &self.title_box,
-            &self.user_box,
-            &self.url_box,
-            &self.notes_box,
-            &self.pass_box,
+            &self.ui_context[self.search_box],
+            &self.ui_context[self.refresh_btn],
+            &self.ui_context[self.sync_btn],
+            &self.ui_context[self.new_btn],
+            &self.ui_context[self.reveal_btn],
+            &self.ui_context[self.copy_btn],
+            &self.ui_context[self.otp_btn],
+            &self.ui_context[self.edit_btn],
+            &self.ui_context[self.delete_btn],
+            &self.ui_context[self.save_btn],
+            &self.ui_context[self.cancel_btn],
+            &self.ui_context[self.title_box],
+            &self.ui_context[self.user_box],
+            &self.ui_context[self.url_box],
+            &self.ui_context[self.notes_box],
+            &self.ui_context[self.pass_box],
         ]
     }
 }
@@ -1070,23 +1070,25 @@ impl Application for SecretsApp {
         // The app keeps calloop's sender; `AppSender` converts into it.
         let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        // The context owns the widgets; the app keeps their handles.
+        let mut ui_context = cce_ui::context::UiContext::new();
         Self {
-            search_box: Owned::new(TextBox::new(String::new()).with_placeholder("Search")),
-            refresh_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Refresh")),
-            sync_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Sync")),
-            new_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("New")),
-            reveal_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Reveal")),
-            copy_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy")),
-            otp_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy code")),
-            edit_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Edit")),
-            delete_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Delete")),
-            save_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Save")),
-            cancel_btn: Owned::new(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Cancel")),
-            title_box: Owned::new(TextBox::new(String::new()).with_placeholder("title")),
-            user_box: Owned::new(TextBox::new(String::new()).with_placeholder("username")),
-            url_box: Owned::new(TextBox::new(String::new()).with_placeholder("url")),
-            notes_box: Owned::new(TextBox::new(String::new()).with_placeholder("notes")),
-            pass_box: Owned::new(TextBox::new(String::new()).with_password(true).with_placeholder("password")),
+            search_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("Search")),
+            refresh_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Refresh")),
+            sync_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Sync")),
+            new_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("New")),
+            reveal_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Reveal")),
+            copy_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy")),
+            otp_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Copy code")),
+            edit_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Edit")),
+            delete_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Delete")),
+            save_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Save")),
+            cancel_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Cancel")),
+            title_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("title")),
+            user_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("username")),
+            url_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("url")),
+            notes_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("notes")),
+            pass_box: ui_context.insert(TextBox::new(String::new()).with_password(true).with_placeholder("password")),
             mode: Mode::Browse,
             entries: Vec::new(),
             selected: None,
@@ -1111,7 +1113,7 @@ impl Application for SecretsApp {
             cmd_tx,
             cmd_rx: Some(cmd_rx),
             sender,
-            ui_context: cce_ui::context::UiContext::new(),
+            ui_context,
         }
     }
 
@@ -1292,29 +1294,6 @@ impl Application for SecretsApp {
         let sw = size.width as f32;
         let sh = size.height as f32;
 
-        // Widget roots re-registered every frame (idempotent; the frame is
-        // assembled by hand, so nothing else registers them).
-        {
-            self.ui_context.register_host(&mut self.search_box);
-            {
-                self.ui_context.register_host(&mut self.sync_btn);
-            }
-            self.ui_context.register_host(&mut self.refresh_btn);
-            self.ui_context.register_host(&mut self.new_btn);
-            self.ui_context.register_host(&mut self.reveal_btn);
-            self.ui_context.register_host(&mut self.copy_btn);
-            self.ui_context.register_host(&mut self.otp_btn);
-            self.ui_context.register_host(&mut self.edit_btn);
-            self.ui_context.register_host(&mut self.delete_btn);
-            self.ui_context.register_host(&mut self.save_btn);
-            self.ui_context.register_host(&mut self.cancel_btn);
-            self.ui_context.register_host(&mut self.title_box);
-            self.ui_context.register_host(&mut self.user_box);
-            self.ui_context.register_host(&mut self.url_box);
-            self.ui_context.register_host(&mut self.notes_box);
-            self.ui_context.register_host(&mut self.pass_box);
-        }
-
         let mut pc = cce_ui::scene::paint::PaintCtx::new();
         let quad = |pc: &mut cce_ui::scene::paint::PaintCtx, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| {
             pc.quad(Rect { x, y, width: w, height: h }, c);
@@ -1336,10 +1315,10 @@ impl Application for SecretsApp {
         let box_h = cce_ui::layout::textbox_height();
 
         // ── Left panel: search + entry list ──
-        self.search_box.set_rect(inset, inset, LIST_W, box_h);
-        self.refresh_btn.set_rect(sw - inset - BTN_W, inset, BTN_W, btn_h);
-        self.new_btn.set_rect(sw - inset - BTN_W * 2.0 - gap, inset, BTN_W, btn_h);
-        self.sync_btn.set_rect(sw - inset - BTN_W * 3.0 - 2.0 * gap, inset, BTN_W, btn_h);
+        self.ui_context[self.search_box].set_rect(inset, inset, LIST_W, box_h);
+        self.ui_context[self.refresh_btn].set_rect(sw - inset - BTN_W, inset, BTN_W, btn_h);
+        self.ui_context[self.new_btn].set_rect(sw - inset - BTN_W * 2.0 - gap, inset, BTN_W, btn_h);
+        self.ui_context[self.sync_btn].set_rect(sw - inset - BTN_W * 3.0 - 2.0 * gap, inset, BTN_W, btn_h);
 
         // Below the taller of the search box and the button row beside it.
         let list_y = inset + box_h.max(btn_h) + gap;
@@ -1415,22 +1394,22 @@ impl Application for SecretsApp {
                 // Each field is a 10px label strip (14.0) over a textbox. The
                 // fields are `pgap` apart rather than `control_gap()`: five
                 // control-height gaps overrun the default window height.
-                for (label, tb) in labels.iter().zip(self.form_boxes_mut()) {
-                    tb.set_rect(dx, fy + 14.0, box_w, box_h);
+                for (label, tb) in labels.iter().zip(self.form_boxes()) {
+                    self.ui_context[tb].set_rect(dx, fy + 14.0, box_w, box_h);
                     pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, None);
                     fy += 14.0 + box_h + pgap;
                 }
-                self.save_btn.set_rect(dx, fy, BTN_W, btn_h);
-                self.cancel_btn.set_rect(dx + BTN_W + pgap, fy, BTN_W, btn_h);
-                for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.otp_btn, &mut self.edit_btn, &mut self.delete_btn, &mut self.new_btn] {
-                    park(b);
+                self.ui_context[self.save_btn].set_rect(dx, fy, BTN_W, btn_h);
+                self.ui_context[self.cancel_btn].set_rect(dx + BTN_W + pgap, fy, BTN_W, btn_h);
+                for b in [self.reveal_btn, self.copy_btn, self.otp_btn, self.edit_btn, self.delete_btn, self.new_btn] {
+                    park(&mut self.ui_context[b]);
                 }
             }
             Mode::Browse => {
-                park(&mut self.save_btn);
-                park(&mut self.cancel_btn);
-                for tb in self.form_boxes_mut() {
-                    tb.set_rect(-1000.0, -1000.0, 10.0, 10.0);
+                park(&mut self.ui_context[self.save_btn]);
+                park(&mut self.ui_context[self.cancel_btn]);
+                for tb in self.form_boxes() {
+                    self.ui_context[tb].set_rect(-1000.0, -1000.0, 10.0, 10.0);
                 }
                 if let Some(entry) = self.selected_entry().cloned() {
                     pc.text_with(entry.label.clone(), dx, hy, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
@@ -1461,33 +1440,33 @@ impl Application for SecretsApp {
                         pc.text_with(format!("{code}  ·  {left}s"), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
                     }
 
-                    self.reveal_btn.set_label(if revealed { "Hide" } else { "Reveal" });
-                    self.delete_btn.set_label(
+                    self.ui_context[self.reveal_btn].set_label(if revealed { "Hide" } else { "Reveal" });
+                    self.ui_context[self.delete_btn].set_label(
                         if self.pending_delete.as_deref() == Some(entry.path.as_str()) { "Confirm" } else { "Delete" },
                     );
                     // Two button rows under the secret line (14.0, its advance).
                     let by = ay + 14.0 + pgap;
-                    self.reveal_btn.set_rect(dx, by, BTN_W, btn_h);
-                    self.copy_btn.set_rect(dx + BTN_W + pgap, by, BTN_W, btn_h);
-                    self.edit_btn.set_rect(dx, by + btn_h + pgap, BTN_W, btn_h);
-                    self.delete_btn.set_rect(dx + BTN_W + pgap, by + btn_h + pgap, BTN_W, btn_h);
+                    self.ui_context[self.reveal_btn].set_rect(dx, by, BTN_W, btn_h);
+                    self.ui_context[self.copy_btn].set_rect(dx + BTN_W + pgap, by, BTN_W, btn_h);
+                    self.ui_context[self.edit_btn].set_rect(dx, by + btn_h + pgap, BTN_W, btn_h);
+                    self.ui_context[self.delete_btn].set_rect(dx + BTN_W + pgap, by + btn_h + pgap, BTN_W, btn_h);
                     // Copy code ends the first row when the pane is wide
                     // enough, else opens a third.
                     if otp.is_some() {
                         let third = dx + 2.0 * (BTN_W + pgap);
                         if third + BTN_W <= dx + dw {
-                            self.otp_btn.set_rect(third, by, BTN_W, btn_h);
+                            self.ui_context[self.otp_btn].set_rect(third, by, BTN_W, btn_h);
                         } else {
-                            self.otp_btn.set_rect(dx, by + 2.0 * (btn_h + pgap), BTN_W, btn_h);
+                            self.ui_context[self.otp_btn].set_rect(dx, by + 2.0 * (btn_h + pgap), BTN_W, btn_h);
                         }
                     } else {
-                        park(&mut self.otp_btn);
+                        park(&mut self.ui_context[self.otp_btn]);
                     }
                 } else {
                     let hint = if self.entries.is_empty() { "" } else { "Select an entry" };
                     pc.text_with(hint.to_string(), dx, hy, 11.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
-                    for b in [&mut self.reveal_btn, &mut self.copy_btn, &mut self.otp_btn, &mut self.edit_btn, &mut self.delete_btn] {
-                        park(b);
+                    for b in [self.reveal_btn, self.copy_btn, self.otp_btn, self.edit_btn, self.delete_btn] {
+                        park(&mut self.ui_context[b]);
                     }
                 }
             }
@@ -1556,8 +1535,8 @@ impl Application for SecretsApp {
         }
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let mut roots = vec![self.search_box.id()];
-        roots.extend(self.buttons_mut().map(|b| b.id()));
-        roots.extend(self.form_boxes_mut().map(|b| b.id()));
+        roots.extend(self.buttons().map(|b| b.id()));
+        roots.extend(self.form_boxes().map(|b| b.id()));
         for root in roots {
             if self.ui_context.propagate_event(&mv, root) {
                 *needs_rebuild = true;
@@ -1601,7 +1580,7 @@ impl Application for SecretsApp {
 
         // Buttons: propagate, then drain clicks into messages.
         let button_roots: Vec<_> = {
-            let bs = self.buttons_mut();
+            let bs = self.buttons();
             bs.iter().map(|b| b.id()).collect()
         };
         for root in button_roots {
@@ -1609,61 +1588,61 @@ impl Application for SecretsApp {
                 *needs_rebuild = true;
             }
         }
-        if self.refresh_btn.take_click() {
+        if self.ui_context[self.refresh_btn].take_click() {
             return Some(AppMessage::RefreshClicked);
         }
-        if self.sync_btn.take_click() {
+        if self.ui_context[self.sync_btn].take_click() {
             return Some(AppMessage::SyncClicked);
         }
-        if self.new_btn.take_click() {
+        if self.ui_context[self.new_btn].take_click() {
             return Some(AppMessage::NewClicked);
         }
-        if self.reveal_btn.take_click() {
+        if self.ui_context[self.reveal_btn].take_click() {
             return Some(AppMessage::RevealClicked);
         }
-        if self.copy_btn.take_click() {
+        if self.ui_context[self.copy_btn].take_click() {
             return Some(AppMessage::CopyClicked);
         }
-        if self.otp_btn.take_click() {
+        if self.ui_context[self.otp_btn].take_click() {
             return Some(AppMessage::CopyOtpClicked);
         }
-        if self.edit_btn.take_click() {
+        if self.ui_context[self.edit_btn].take_click() {
             return Some(AppMessage::EditClicked);
         }
-        if self.delete_btn.take_click() {
+        if self.ui_context[self.delete_btn].take_click() {
             return Some(AppMessage::DeleteClicked);
         }
-        if self.save_btn.take_click() {
+        if self.ui_context[self.save_btn].take_click() {
             return Some(AppMessage::SaveClicked);
         }
-        if self.cancel_btn.take_click() {
+        if self.ui_context[self.cancel_btn].take_click() {
             return Some(AppMessage::CancelClicked);
         }
 
         // Text boxes: unfocus the ones the press missed, then propagate.
         let mut box_roots = vec![self.search_box.id()];
         if self.editing() {
-            box_roots.extend(self.form_boxes_mut().map(|b| b.id()));
+            box_roots.extend(self.form_boxes().map(|b| b.id()));
         }
         if state == ElementState::Pressed {
-            if !self.search_box.hit_test(lx, ly, &self.ui_context) {
-                self.search_box.unfocus();
+            if !self.ui_context[self.search_box].hit_test(lx, ly, &self.ui_context) {
+                self.ui_context[self.search_box].unfocus();
             }
             if self.editing() {
-                if !self.title_box.hit_test(lx, ly, &self.ui_context) {
-                    self.title_box.unfocus();
+                if !self.ui_context[self.title_box].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context[self.title_box].unfocus();
                 }
-                if !self.user_box.hit_test(lx, ly, &self.ui_context) {
-                    self.user_box.unfocus();
+                if !self.ui_context[self.user_box].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context[self.user_box].unfocus();
                 }
-                if !self.url_box.hit_test(lx, ly, &self.ui_context) {
-                    self.url_box.unfocus();
+                if !self.ui_context[self.url_box].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context[self.url_box].unfocus();
                 }
-                if !self.notes_box.hit_test(lx, ly, &self.ui_context) {
-                    self.notes_box.unfocus();
+                if !self.ui_context[self.notes_box].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context[self.notes_box].unfocus();
                 }
-                if !self.pass_box.hit_test(lx, ly, &self.ui_context) {
-                    self.pass_box.unfocus();
+                if !self.ui_context[self.pass_box].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context[self.pass_box].unfocus();
                 }
             }
         }
@@ -1729,10 +1708,10 @@ impl Application for SecretsApp {
                         return Some(AppMessage::CancelClicked);
                     }
                     // TextBox never tracks ctx focus — `editing` is its focus signal.
-                    if self.search_box.editing {
-                        self.search_box.text.clear();
-                        self.search_box.edit_buffer.clear();
-                        self.search_box.unfocus();
+                    if self.ui_context[self.search_box].editing {
+                        self.ui_context[self.search_box].text.clear();
+                        self.ui_context[self.search_box].edit_buffer.clear();
+                        self.ui_context[self.search_box].unfocus();
                         let before = self.scroll_y;
                         self.scroll_y = 0.0;
                         self.note_scroll_from(before);
@@ -1743,20 +1722,20 @@ impl Application for SecretsApp {
                 Key::Named(NamedKey::Tab) if self.editing() => {
                     // TextBox never tracks ctx focus — `editing` is its focus signal.
                     let focused = [
-                        self.title_box.editing,
-                        self.user_box.editing,
-                        self.url_box.editing,
-                        self.notes_box.editing,
-                        self.pass_box.editing,
+                        self.ui_context[self.title_box].editing,
+                        self.ui_context[self.user_box].editing,
+                        self.ui_context[self.url_box].editing,
+                        self.ui_context[self.notes_box].editing,
+                        self.ui_context[self.pass_box].editing,
                     ]
                     .iter()
                     .position(|&f| f);
                     let next = focused.map(|i| (i + 1) % 5).unwrap_or(0);
-                    for (i, tb) in self.form_boxes_mut().into_iter().enumerate() {
+                    for (i, tb) in self.form_boxes().into_iter().enumerate() {
                         if i == next {
-                            tb.focus();
+                            self.ui_context[tb].focus();
                         } else {
-                            tb.unfocus();
+                            self.ui_context[tb].unfocus();
                         }
                     }
                     *needs_rebuild = true;
@@ -1771,7 +1750,7 @@ impl Application for SecretsApp {
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
         let mut roots = vec![self.search_box.id()];
         if self.editing() {
-            roots.extend(self.form_boxes_mut().map(|b| b.id()));
+            roots.extend(self.form_boxes().map(|b| b.id()));
         }
         for root in roots {
             if self.ui_context.propagate_event(&kev, root) {
