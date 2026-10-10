@@ -1051,7 +1051,7 @@ fn park(btn: &mut cce_ui::widget::Adapted<Button>) {
 }
 
 fn srgb_u8(linear: [f32; 4]) -> [u8; 3] {
-    let srgb = cce_ui::colors::to_srgb(linear);
+    let srgb = cce_ui::color::to_srgb(linear);
     [
         (srgb[0] * 255.0) as u8,
         (srgb[1] * 255.0) as u8,
@@ -1354,7 +1354,7 @@ impl Application for SecretsApp {
                 inset + pad,
                 ry + 8.0,
                 12.0,
-                srgb_u8(cce_ui::colors::TEXT_HEADER),
+                srgb_u8(cce_ui::color::TEXT_HEADER),
                 None,
                 list_bounds,
             );
@@ -1364,7 +1364,7 @@ impl Application for SecretsApp {
                     inset + pad,
                     ry + 25.0,
                     10.0,
-                    srgb_u8(cce_ui::colors::TEXT_DIM),
+                    srgb_u8(cce_ui::color::TEXT_DIM),
                     None,
                     list_bounds,
                 );
@@ -1387,7 +1387,7 @@ impl Application for SecretsApp {
         match &self.mode {
             Mode::Edit { path } => {
                 let header = if path.is_some() { "Edit entry" } else { "New entry" };
-                pc.text_with(header.to_string(), dx, hy, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
+                pc.text_with(header.to_string(), dx, hy, 15.0, srgb_u8(cce_ui::color::TEXT_HEADER), None, detail_bounds);
                 let labels = ["Title", "UserName", "URL", "Notes", "Password"];
                 let mut fy = hy + 22.0 + pgap;
                 let box_w = (dw - 4.0).min(320.0); // TODO(style): 4px slack on the field width, not a rung
@@ -1396,7 +1396,7 @@ impl Application for SecretsApp {
                 // control-height gaps overrun the default window height.
                 for (label, tb) in labels.iter().zip(self.form_boxes()) {
                     self.ui_context[tb].set_rect(dx, fy + 14.0, box_w, box_h);
-                    pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, None);
+                    pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, None);
                     fy += 14.0 + box_h + pgap;
                 }
                 self.ui_context[self.save_btn].set_rect(dx, fy, BTN_W, btn_h);
@@ -1412,32 +1412,32 @@ impl Application for SecretsApp {
                     self.ui_context[tb].set_rect(-1000.0, -1000.0, 10.0, 10.0);
                 }
                 if let Some(entry) = self.selected_entry().cloned() {
-                    pc.text_with(entry.label.clone(), dx, hy, 15.0, srgb_u8(cce_ui::colors::TEXT_HEADER), None, detail_bounds);
-                    pc.text_with(entry.collection.clone(), dx, hy + 22.0, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                    pc.text_with(entry.label.clone(), dx, hy, 15.0, srgb_u8(cce_ui::color::TEXT_HEADER), None, detail_bounds);
+                    pc.text_with(entry.collection.clone(), dx, hy + 22.0, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
 
                     // The header block (a 15px line, a 10px line), a pane gap,
                     // then the attribute rows at their 22.0 line advance.
                     let mut ay = hy + 22.0 + 14.0 + pgap;
                     for (key, value) in &entry.attrs {
-                        pc.text_with(key.clone(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
-                        pc.text_with(value.clone(), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
+                        pc.text_with(key.clone(), dx, ay, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
+                        pc.text_with(value.clone(), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::color::TEXT_FG), None, detail_bounds);
                         ay += 22.0;
                     }
 
                     ay += pgap;
-                    pc.text_with("secret".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                    pc.text_with("secret".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
                     let (secret_text, revealed) = match self.revealed_secret() {
                         Some(s) => (s.to_string(), true),
                         None => ("••••••••••••".to_string(), false),
                     };
-                    pc.text_with(secret_text, dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
+                    pc.text_with(secret_text, dx + 120.0, ay, 11.0, srgb_u8(cce_ui::color::TEXT_FG), None, detail_bounds);
 
                     let otp = self.shown_otp().map(|(code, left)| (group_code(code), left));
                     if let Some((code, left)) = &otp {
                         self.otp_drawn_left = *left;
                         ay += 22.0;
-                        pc.text_with("one-time code".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
-                        pc.text_with(format!("{code}  ·  {left}s"), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::colors::TEXT_FG), None, detail_bounds);
+                        pc.text_with("one-time code".to_string(), dx, ay, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
+                        pc.text_with(format!("{code}  ·  {left}s"), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::color::TEXT_FG), None, detail_bounds);
                     }
 
                     self.ui_context[self.reveal_btn].set_label(if revealed { "Hide" } else { "Reveal" });
@@ -1464,7 +1464,7 @@ impl Application for SecretsApp {
                     }
                 } else {
                     let hint = if self.entries.is_empty() { "" } else { "Select an entry" };
-                    pc.text_with(hint.to_string(), dx, hy, 11.0, srgb_u8(cce_ui::colors::TEXT_DIM), None, detail_bounds);
+                    pc.text_with(hint.to_string(), dx, hy, 11.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
                     for b in [self.reveal_btn, self.copy_btn, self.otp_btn, self.edit_btn, self.delete_btn] {
                         park(&mut self.ui_context[b]);
                     }
@@ -1481,7 +1481,7 @@ impl Application for SecretsApp {
             cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
 
-        let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::colors::TEXT_DIM) };
+        let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::color::TEXT_DIM) };
         pc.text_with(
             self.status_msg.clone(),
             inset,
@@ -1499,7 +1499,7 @@ impl Application for SecretsApp {
                 sw - inset - w,
                 sh - STATUS_H + 6.0,
                 10.0,
-                srgb_u8(cce_ui::colors::TEXT_DIM),
+                srgb_u8(cce_ui::color::TEXT_DIM),
                 None,
                 Some([inset, sh - STATUS_H, sw - inset, sh]),
             );
