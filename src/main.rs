@@ -1478,7 +1478,7 @@ impl Application for SecretsApp {
         // tuple views: a flat fill in `color()`, the plain quads, then the
         // text, so no control here had the relief every other app's has.)
         for w in self.widgets_iter() {
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, w, &mut pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
 
         let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::colors::TEXT_DIM) };
