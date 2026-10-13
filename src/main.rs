@@ -2,7 +2,7 @@ use secret_service::{EncryptionType, SecretService};
 
 use cce_ui::widget::Handle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetHost, LINE_PX};
+use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetEvent, WidgetHost, LINE_PX};
 
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
@@ -936,15 +936,17 @@ impl SecretsApp {
         self.mode = Mode::Edit { path: entry.map(|e| e.path.clone()) };
         self.pending_delete = None;
         self.revealed = None;
+        // Through the context, not the widgets: the Tab walk steps on from the
+        // box the window records as focused.
         for b in self.form_boxes() {
-            self.ui_context[b].unfocus();
+            self.ui_context.unfocus_id(b.id());
         }
-        self.ui_context[self.title_box].focus();
+        self.ui_context.focus_id(self.title_box.id());
     }
 
     fn close_form(&mut self) {
         for b in self.form_boxes() {
-            self.ui_context[b].unfocus();
+            self.ui_context.unfocus_id(b.id());
         }
         self.mode = Mode::Browse;
     }
@@ -1024,6 +1026,52 @@ impl SecretsApp {
         ]
     }
 
+    /// Whether one of the buttons has the keyboard (the Tab walk put it there):
+    /// Enter is then that button's, not the form's Save.
+    fn button_focused(&self) -> bool {
+        self.buttons().iter().any(|b| self.ui_context.is_focused_id(b.id()))
+    }
+
+    /// What the widgets reported since the last sweep, as the message the hook
+    /// returns: a button's click. The text boxes' changes are not wanted (the
+    /// list and the form read their live text). One dispatch clicks at most one
+    /// button; a second would go through the sender rather than be lost.
+    fn drain_widget_events(&mut self) -> Option<AppMessage> {
+        let mut first = None;
+        for (id, ev) in self.ui_context.take_events() {
+            let WidgetEvent::Clicked = ev else { continue };
+            let msg = if id == self.refresh_btn.id() {
+                AppMessage::RefreshClicked
+            } else if id == self.sync_btn.id() {
+                AppMessage::SyncClicked
+            } else if id == self.new_btn.id() {
+                AppMessage::NewClicked
+            } else if id == self.reveal_btn.id() {
+                AppMessage::RevealClicked
+            } else if id == self.copy_btn.id() {
+                AppMessage::CopyClicked
+            } else if id == self.otp_btn.id() {
+                AppMessage::CopyOtpClicked
+            } else if id == self.edit_btn.id() {
+                AppMessage::EditClicked
+            } else if id == self.delete_btn.id() {
+                AppMessage::DeleteClicked
+            } else if id == self.save_btn.id() {
+                AppMessage::SaveClicked
+            } else if id == self.cancel_btn.id() {
+                AppMessage::CancelClicked
+            } else {
+                continue;
+            };
+            if first.is_none() {
+                first = Some(msg);
+            } else {
+                let _ = self.sender.send(msg);
+            }
+        }
+        first
+    }
+
     fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
             &self.ui_context[self.search_box],
@@ -1064,6 +1112,13 @@ impl Application for SecretsApp {
 
     fn ui_context(&self) -> Option<&cce_ui::context::UiContext> {
         Some(&self.ui_context)
+    }
+
+    /// The runner's Tab / Shift+Tab walk, its undo/redo routing to the focused
+    /// box and an assistive tool's actions all go through this; while it
+    /// returned `None`, Tab did nothing outside the form.
+    fn ui_context_mut(&mut self) -> Option<&mut cce_ui::context::UiContext> {
+        Some(&mut self.ui_context)
     }
 
     fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
@@ -1588,35 +1643,8 @@ impl Application for SecretsApp {
                 *needs_rebuild = true;
             }
         }
-        if self.ui_context[self.refresh_btn].take_click() {
-            return Some(AppMessage::RefreshClicked);
-        }
-        if self.ui_context[self.sync_btn].take_click() {
-            return Some(AppMessage::SyncClicked);
-        }
-        if self.ui_context[self.new_btn].take_click() {
-            return Some(AppMessage::NewClicked);
-        }
-        if self.ui_context[self.reveal_btn].take_click() {
-            return Some(AppMessage::RevealClicked);
-        }
-        if self.ui_context[self.copy_btn].take_click() {
-            return Some(AppMessage::CopyClicked);
-        }
-        if self.ui_context[self.otp_btn].take_click() {
-            return Some(AppMessage::CopyOtpClicked);
-        }
-        if self.ui_context[self.edit_btn].take_click() {
-            return Some(AppMessage::EditClicked);
-        }
-        if self.ui_context[self.delete_btn].take_click() {
-            return Some(AppMessage::DeleteClicked);
-        }
-        if self.ui_context[self.save_btn].take_click() {
-            return Some(AppMessage::SaveClicked);
-        }
-        if self.ui_context[self.cancel_btn].take_click() {
-            return Some(AppMessage::CancelClicked);
+        if let Some(msg) = self.drain_widget_events() {
+            return Some(msg);
         }
 
         // Text boxes: unfocus the ones the press missed, then propagate.
@@ -1625,24 +1653,13 @@ impl Application for SecretsApp {
             box_roots.extend(self.form_boxes().map(|b| b.id()));
         }
         if state == ElementState::Pressed {
-            if !self.ui_context[self.search_box].hit_test(lx, ly, &self.ui_context) {
-                self.ui_context[self.search_box].unfocus();
-            }
+            let mut missed = vec![self.search_box];
             if self.editing() {
-                if !self.ui_context[self.title_box].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context[self.title_box].unfocus();
-                }
-                if !self.ui_context[self.user_box].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context[self.user_box].unfocus();
-                }
-                if !self.ui_context[self.url_box].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context[self.url_box].unfocus();
-                }
-                if !self.ui_context[self.notes_box].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context[self.notes_box].unfocus();
-                }
-                if !self.ui_context[self.pass_box].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context[self.pass_box].unfocus();
+                missed.extend(self.form_boxes());
+            }
+            for b in missed {
+                if !self.ui_context[b].hit_test(lx, ly, &self.ui_context) {
+                    self.ui_context.unfocus_id(b.id());
                 }
             }
         }
@@ -1711,7 +1728,7 @@ impl Application for SecretsApp {
                     if self.ui_context[self.search_box].editing {
                         self.ui_context[self.search_box].text.clear();
                         self.ui_context[self.search_box].edit_buffer.clear();
-                        self.ui_context[self.search_box].unfocus();
+                        self.ui_context.unfocus_id(self.search_box.id());
                         let before = self.scroll_y;
                         self.scroll_y = 0.0;
                         self.note_scroll_from(before);
@@ -1719,29 +1736,9 @@ impl Application for SecretsApp {
                         return None;
                     }
                 }
-                Key::Named(NamedKey::Tab) if self.editing() => {
-                    // TextBox never tracks ctx focus — `editing` is its focus signal.
-                    let focused = [
-                        self.ui_context[self.title_box].editing,
-                        self.ui_context[self.user_box].editing,
-                        self.ui_context[self.url_box].editing,
-                        self.ui_context[self.notes_box].editing,
-                        self.ui_context[self.pass_box].editing,
-                    ]
-                    .iter()
-                    .position(|&f| f);
-                    let next = focused.map(|i| (i + 1) % 5).unwrap_or(0);
-                    for (i, tb) in self.form_boxes().into_iter().enumerate() {
-                        if i == next {
-                            self.ui_context[tb].focus();
-                        } else {
-                            self.ui_context[tb].unfocus();
-                        }
-                    }
-                    *needs_rebuild = true;
-                    return None;
-                }
-                Key::Named(NamedKey::Enter) if self.editing() => {
+                // Tab never arrives here: the runner walks the focus
+                // (`ui_context_mut`), through the form's boxes, Save and Cancel.
+                Key::Named(NamedKey::Enter) if self.editing() && !self.button_focused() => {
                     return Some(AppMessage::SaveClicked);
                 }
                 _ => {}
@@ -1752,16 +1749,25 @@ impl Application for SecretsApp {
         if self.editing() {
             roots.extend(self.form_boxes().map(|b| b.id()));
         }
-        for root in roots {
-            if self.ui_context.propagate_event(&kev, root) {
-                *needs_rebuild = true;
-            }
+        if propagate_key(&mut self.ui_context, &kev, &roots) {
+            *needs_rebuild = true;
         }
         let before = self.scroll_y;
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
         self.note_scroll_from(before);
-        None
+        // Enter / Space on a focused button (or an assistive tool's click, which
+        // arrives as Space) acts now, not at the next pointer event.
+        self.drain_widget_events()
     }
+}
+
+/// Hand a key to the first of `roots` that takes it. `propagate_event` offers a
+/// key to the focused widget before it walks the root, on every call, so a loop
+/// over every root delivered it once per root: with the context's focus on an
+/// editing box (a click on it, the Tab walk, `open_form`), each letter went in
+/// once per form box.
+fn propagate_key(ctx: &mut cce_ui::context::UiContext, kev: &cce_ui::widget::Event, roots: &[cce_ui::widget::WidgetId]) -> bool {
+    roots.iter().any(|&root| ctx.propagate_event(kev, root))
 }
 
 fn main() {
@@ -1772,6 +1778,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One letter typed into the form is one letter, whichever box the
+    /// context has focused and however many roots the key is offered to.
+    #[test]
+    fn a_key_reaches_the_focused_box_once() {
+        let mut ctx = cce_ui::context::UiContext::new();
+        let boxes: Vec<_> = (0..5)
+            .map(|i| {
+                let h = ctx.insert(TextBox::new(String::new()));
+                ctx[h].set_rect(0.0, i as f32 * 40.0, 200.0, 30.0);
+                h
+            })
+            .collect();
+        ctx.focus_id(boxes[1].id());
+        assert!(ctx[boxes[1]].editing);
+        let kev = cce_ui::widget::Event::KeyInput(KeyEvent {
+            state: ElementState::Pressed,
+            logical_key: Key::Character("x".to_string()),
+            text: Some("x".to_string()),
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        });
+        let roots: Vec<_> = boxes.iter().map(|b| b.id()).collect();
+        assert!(propagate_key(&mut ctx, &kev, &roots));
+        assert_eq!(ctx[boxes[1]].edit_buffer, "x");
+        for (i, b) in boxes.iter().enumerate().filter(|(i, _)| *i != 1) {
+            assert!(ctx[*b].edit_buffer.is_empty(), "box {i} took a key it was not focused for");
+        }
+    }
 
     #[test]
     fn an_edit_keeps_every_attribute_the_form_does_not_show() {
