@@ -188,15 +188,15 @@ async fn run_sync() -> (String, bool) {
             if out.status.success() {
                 let line = pick(&out.stdout);
                 let msg = if line.is_empty() { "synced".to_string() } else { line };
-                return (msg, false);
+                (msg, false)
             } else {
                 let line = pick(&out.stderr);
                 let msg = if line.is_empty() { "sync failed".to_string() } else { line };
-                return (msg, true);
+                (msg, true)
             }
         }
         Err(e) => {
-            return (format!("cce-keyring-sync not runnable: {e}"), true);
+            (format!("cce-keyring-sync not runnable: {e}"), true)
         }
     }
 }
@@ -462,7 +462,7 @@ async fn load_entries(ss: &SecretService<'_>, tx: &calloop::channel::Sender<AppM
             });
         }
     }
-    entries.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    entries.sort_by_key(|a| a.label.to_lowercase());
     let _ = tx.send(AppMessage::Loaded(entries));
 }
 
@@ -1346,8 +1346,8 @@ impl Application for SecretsApp {
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
         use cce_ui::scene::layout::Rect;
         cce_ui::scale::set_scale_factor(scale as f32);
-        let sw = size.width as f32;
-        let sh = size.height as f32;
+        let sw = size.width;
+        let sh = size.height;
 
         let mut pc = cce_ui::scene::paint::PaintCtx::new();
         let quad = |pc: &mut cce_ui::scene::paint::PaintCtx, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| {

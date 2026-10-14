@@ -137,6 +137,7 @@ pub(crate) fn take_lock() -> Option<std::fs::File> {
     let _ = std::fs::create_dir_all(state_dir());
     let f = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(state_dir().join("lock"))
         .ok()?;

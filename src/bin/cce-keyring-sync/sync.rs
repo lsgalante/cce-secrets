@@ -419,7 +419,7 @@ pub async fn sync_remote<I: Interchange>(
     // ---- apply ----
     // `next` starts as the old base and is rewritten entry by entry, so a
     // remote failure mid-way leaves untouched entries with their old base.
-    let mut next: HashMap<String, EntryState> = state.entries.drain().collect();
+    let mut next: HashMap<String, EntryState> = std::mem::take(&mut state.entries);
     let mut failure: Option<String> = None;
     let mut applied = 0usize;
 
