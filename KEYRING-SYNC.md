@@ -302,6 +302,19 @@ Same table as the kdbx, with the id attribute renamed:
 | field purpose PASSWORD | the secret |
 | first `urls[]` with `primary: true`, else the first | `URL` |
 | field purpose NOTES | `Notes` |
+| custom text field (no purpose; STRING / EMAIL / URL / PHONE) labelled `L` | `field:L` |
+
+Custom fields (added 2026-10-17): only text-valued ones are mirrored, keyed
+by label, the first of a label winning. CONCEALED fields and OTP seeds stay
+1Password-side, because keyring attributes are readable by any Secret
+Service client without touching a secret. A field cce-secrets adds goes in
+beside the item's existing custom fields, in their section (with no section
+when there are none); one it removes or renames is deleted from the item;
+anything not mirrored is never touched. They join the entry hash only when
+present, so bases from before did not go stale; `State.fields` marks the
+base as covering them, and a base below it has every timestamp cleared once
+so the next pass fetches each item and copies the custom fields 1Password
+already held into the keyring (about one `op` call per item, once).
 
 Entries born in cce-secrets (no `op-item`) get created in 1Password at the
 next sync and stamped, as kdbx UUIDs are minted today. Which vault new

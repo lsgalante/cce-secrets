@@ -10,6 +10,7 @@
 //! The `Interchange` trait is what the merge loop (sync.rs) calls; 1Password
 //! is its only implementation since the kdbx backend retired.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -32,7 +33,13 @@ const APP_DOWN: &str = "cannot connect to 1Password app";
 /// `op item get --otp` on an item without a one-time password field.
 const NO_OTP: &str = "doesn't contain any OTP-type fields";
 
-/// One remote entry, whole: the six fields the merge hashes plus identity.
+/// Custom field types mirrored to the keyring: the text-valued ones. A
+/// CONCEALED field (or an OTP seed) stays 1Password-side, since keyring
+/// attributes are searchable metadata any Secret Service client reads
+/// without unlocking a secret.
+const SYNCED_FIELD_TYPES: [&str; 4] = ["STRING", "EMAIL", "URL", "PHONE"];
+
+/// One remote entry, whole: the fields the merge hashes plus identity.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct RemoteEntry {
     pub id: String,
@@ -43,6 +50,8 @@ pub struct RemoteEntry {
     pub password: String,
     pub url: String,
     pub notes: String,
+    /// Custom text fields, label → value ([`synced_fields`]).
+    pub fields: BTreeMap<String, String>,
     /// Server-side modification time, unix seconds (0 when unparseable).
     pub updated: i64,
     /// `updated` as canonical RFC 3339 UTC text (`2026-09-21T16:27:42Z`),
@@ -249,6 +258,49 @@ fn primary_url(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Indices into `fields` of the custom fields the mirror carries: no
+/// purpose, a text type, a label, and the first of that label — a second
+/// field of the same label is left alone, as is everything else.
+fn synced_field_indices(fields: &[Value]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    (0..fields.len())
+        .filter(|&i| {
+            let f = &fields[i];
+            let purpose = s(f, "purpose");
+            let kind = s(f, "type");
+            let label = s(f, "label");
+            purpose.is_empty()
+                && SYNCED_FIELD_TYPES.contains(&kind.as_str())
+                && !label.is_empty()
+                && seen.insert(label)
+        })
+        .collect()
+}
+
+/// An item's mirrored custom fields, label → value.
+fn synced_fields(v: &Value) -> BTreeMap<String, String> {
+    let Some(fields) = v.get("fields").and_then(Value::as_array) else { return BTreeMap::new() };
+    synced_field_indices(fields).into_iter().map(|i| (s(&fields[i], "label"), s(&fields[i], "value"))).collect()
+}
+
+/// A fresh field id in 1Password's shape: 26 lowercase base-32 characters.
+fn new_field_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0u8; 26];
+    getrandom::getrandom(&mut bytes).expect("entropy");
+    bytes.iter().map(|b| ALPHABET[(*b & 31) as usize] as char).collect()
+}
+
+/// A new custom text field. `section` is the section object to file it
+/// under (copied from a sibling custom field), or none.
+fn custom_field(label: &str, value: &str, section: Option<&Value>) -> Value {
+    let mut f = json!({"id": new_field_id(), "type": "STRING", "label": label, "value": value});
+    if let Some(section) = section {
+        f["section"] = section.clone();
+    }
+    f
+}
+
 fn field_by_purpose<'a>(v: &'a Value, purpose: &str) -> Option<&'a Value> {
     v.get("fields")?
         .as_array()?
@@ -289,6 +341,7 @@ pub fn entry_from_json(v: &Value) -> RemoteEntry {
         password: field("PASSWORD"),
         url: sum.url,
         notes: field("NOTES"),
+        fields: synced_fields(v),
         updated: sum.updated,
         updated_raw: sum.updated_raw,
     }
@@ -308,6 +361,8 @@ pub fn create_template(e: &RemoteEntry) -> Value {
     if !e.url.is_empty() {
         t["urls"] = json!([{"label": "website", "primary": true, "href": e.url}]);
     }
+    let list = t["fields"].as_array_mut().expect("fields array");
+    list.extend(e.fields.iter().map(|(label, value)| custom_field(label, value, None)));
     t
 }
 
@@ -349,6 +404,35 @@ pub fn apply_entry(v: &mut Value, e: &RemoteEntry) {
     set(v, "USERNAME", "username", "STRING", &e.username);
     set(v, "PASSWORD", "password", "CONCEALED", &e.password);
     set(v, "NOTES", "notesPlain", "STRING", &e.notes);
+    apply_fields(v, &e.fields);
+}
+
+/// Make the item's mirrored custom fields `fields`: a label kept has its
+/// value rewritten (type, id and section stay), a label gone is removed,
+/// and a new label is appended beside the existing custom fields, in their
+/// section. Fields the mirror does not carry are never touched.
+fn apply_fields(v: &mut Value, fields: &BTreeMap<String, String>) {
+    let list = v["fields"].as_array_mut().expect("fields array");
+    let synced = synced_field_indices(list);
+    let section = synced.last().and_then(|&i| list[i].get("section")).cloned();
+    let mut present = std::collections::HashSet::new();
+    let mut gone = Vec::new();
+    for i in synced {
+        let label = s(&list[i], "label");
+        match fields.get(&label) {
+            Some(value) => list[i]["value"] = json!(value),
+            None => gone.push(i),
+        }
+        present.insert(label);
+    }
+    for i in gone.into_iter().rev() {
+        list.remove(i);
+    }
+    for (label, value) in fields {
+        if !present.contains(label) {
+            list.push(custom_field(label, value, section.as_ref()));
+        }
+    }
 }
 
 /// RFC 3339 → unix seconds: `2026-09-21T15:41:14Z`, or with a fraction,
@@ -476,7 +560,8 @@ mod tests {
         v["fields"] = json!([
             {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "someone"},
             {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": "old"},
-            {"id": "custom", "type": "STRING", "label": "pin", "value": "1234", "section": {"id": "s1"}}
+            {"id": "custom", "type": "STRING", "label": "pin", "value": "1234", "section": {"id": "s1"}},
+            {"id": "secret", "type": "CONCEALED", "label": "recovery", "value": "xyz", "section": {"id": "s1"}}
         ]);
         let e = RemoteEntry {
             id: "abc".into(),
@@ -485,6 +570,7 @@ mod tests {
             password: "new".into(),
             url: "https://new.example.com".into(),
             notes: "added".into(),
+            fields: [("pin".to_string(), "1234".to_string())].into(),
             ..Default::default()
         };
         apply_entry(&mut v, &e);
@@ -495,7 +581,60 @@ mod tests {
         assert_eq!(got.password, "new");
         assert_eq!(got.notes, "added", "a missing purpose field is appended");
         assert_eq!(v["fields"][2]["value"], "1234", "custom fields survive");
+        assert_eq!(v["fields"][3]["value"], "xyz", "a concealed field is never the mirror's");
         assert_eq!(v["tags"], json!([]), "unrelated keys survive");
+    }
+
+    fn custom_item() -> Value {
+        let mut v: Value = serde_json::from_str(LIST_ITEM).unwrap();
+        v["fields"] = json!([
+            {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "someone"},
+            {"id": "a", "type": "STRING", "label": "pin", "value": "1234", "section": {"id": "s1", "label": "Extra"}},
+            {"id": "b", "type": "EMAIL", "label": "recovery email", "value": "r@example.com", "section": {"id": "s1", "label": "Extra"}},
+            {"id": "c", "type": "CONCEALED", "label": "answer", "value": "secret", "section": {"id": "s1", "label": "Extra"}},
+            {"id": "d", "type": "STRING", "label": "pin", "value": "second", "section": {"id": "s1", "label": "Extra"}},
+            {"id": "e", "type": "STRING", "label": "", "value": "unlabelled"}
+        ]);
+        v
+    }
+
+    #[test]
+    fn only_labelled_text_custom_fields_are_mirrored() {
+        let e = entry_from_json(&custom_item());
+        let want: BTreeMap<String, String> =
+            [("pin".to_string(), "1234".to_string()), ("recovery email".to_string(), "r@example.com".to_string())].into();
+        assert_eq!(e.fields, want, "no purpose fields, no concealed, first of a label, no blank label");
+    }
+
+    #[test]
+    fn apply_fields_edits_removes_and_adds_in_the_sibling_section() {
+        let mut v = custom_item();
+        let fields: BTreeMap<String, String> =
+            [("pin".to_string(), "9999".to_string()), ("member no".to_string(), "42".to_string())].into();
+        apply_fields(&mut v, &fields);
+        let list = v["fields"].as_array().unwrap();
+        let by_id = |id: &str| list.iter().find(|f| f["id"] == id);
+        assert_eq!(by_id("a").unwrap()["value"], "9999", "edited in place");
+        assert!(by_id("b").is_none(), "a label the keyring dropped is removed");
+        assert_eq!(by_id("c").unwrap()["value"], "secret", "concealed untouched");
+        assert_eq!(by_id("d").unwrap()["value"], "second", "a duplicate label untouched");
+        assert_eq!(by_id("e").unwrap()["value"], "unlabelled");
+        let added = list.iter().find(|f| f["label"] == "member no").expect("appended");
+        assert_eq!(added["type"], "STRING");
+        assert_eq!(added["value"], "42");
+        assert_eq!(added["section"]["id"], "s1", "filed beside the other custom fields");
+        assert_eq!(added["id"].as_str().unwrap().len(), 26);
+        assert_eq!(entry_from_json(&v).fields, fields, "reads back as written");
+    }
+
+    #[test]
+    fn the_create_template_carries_custom_fields() {
+        let e = RemoteEntry {
+            title: "T".into(),
+            fields: [("pin".to_string(), "1234".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(entry_from_json(&create_template(&e)).fields, e.fields);
     }
 
     #[test]

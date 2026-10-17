@@ -225,6 +225,7 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
                     url: attrs.get("URL").cloned().unwrap_or_default(),
                     notes: attrs.get("Notes").cloned().unwrap_or_default(),
                     group: String::new(), // becomes the vault name once paired
+                    fields: crate::fields_from_attrs(&attrs),
                     modified,
                 };
                 locals.push(Local { item, attrs, entry });
@@ -339,7 +340,7 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
         match remote.fetch(&rids[ri]).await {
             Ok(e) => {
                 let l = &locals[li].entry;
-                if e.password != l.password || e.url != l.url || e.notes != l.notes {
+                if e.password != l.password || e.url != l.url || e.notes != l.notes || e.fields != l.fields {
                     differing.push(li);
                 }
                 fetched.insert(ri, e);
@@ -351,7 +352,7 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
         }
     }
     if !differing.is_empty() {
-        println!("\nfields differ on {} paired entries (password/url/notes); the first sync takes 1Password's value:", differing.len());
+        println!("\nfields differ on {} paired entries (password/url/notes/custom); the first sync takes 1Password's value:", differing.len());
         for &li in &differing {
             let l = &locals[li].entry;
             let r = &fetched[&plan.pairs.iter().find(|(a, _)| *a == li).unwrap().1];
@@ -364,6 +365,9 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
             }
             if r.notes != l.notes {
                 what.push("notes");
+            }
+            if r.fields != l.fields {
+                what.push("custom fields");
             }
             println!("  {}  [{}]", show(&lkeys[li]), what.join(", "));
         }
@@ -409,6 +413,8 @@ pub async fn adopt(state_path: &std::path::Path, mut state: State, vault: &str, 
     }
     state.version = 2;
     state.backend = "onepassword".to_string();
+    // The differing entries' unknown timestamps already cover custom fields.
+    state.fields = crate::FIELDS_VERSION;
     state.vault = vault.clone();
     state.entries = entries;
     state.last_run = now_unix();

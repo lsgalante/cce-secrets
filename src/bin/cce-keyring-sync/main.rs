@@ -14,8 +14,8 @@
 //! - the state file stores keyed hashes of fields, never values; the hash
 //!   key is itself a keyring item;
 //! - attribute names match cce-secrets: label=Title, UserName, URL, Notes,
-//!   plus op-item / op-vault (kdbx-uuid / kdbx-group linger on old items
-//!   and are ignored);
+//!   `field:<label>` per custom text field, plus op-item / op-vault
+//!   (kdbx-uuid / kdbx-group linger on old items and are ignored);
 //! - the merge never destroys a value: 1Password keeps item history on
 //!   every edit, keyring deletions become Archive entries, and modification
 //!   beats deletion.
@@ -26,13 +26,30 @@ mod op;
 mod serve;
 mod sync;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use secret_service::SecretService;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const APP: &str = "cce-keyring-sync";
+
+/// Keyring attribute prefix of a custom field: `field:PIN` mirrors the
+/// 1Password custom field labelled `PIN` (op.rs, `SYNCED_FIELD_TYPES`).
+/// cce-secrets writes the same names.
+pub(crate) const FIELD_PREFIX: &str = "field:";
+
+/// The `State::fields` value once custom fields are part of the merge.
+pub(crate) const FIELDS_VERSION: u32 = 1;
+
+/// An item's custom fields, out of its attributes: label → value.
+pub(crate) fn fields_from_attrs(attrs: &HashMap<String, String>) -> BTreeMap<String, String> {
+    attrs
+        .iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix(FIELD_PREFIX)?.to_string(), v.clone())))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct State {
@@ -50,6 +67,12 @@ pub(crate) struct State {
     /// for cce-secrets' status line — the daemon has no stdout anyone reads.
     #[serde(default)]
     pub last_result: String,
+    /// Which field set the base hashes cover: 0 before custom fields were
+    /// synced, [`FIELDS_VERSION`] after. A base below it is re-fetched once
+    /// (sync.rs), so the custom fields 1Password already held reach the
+    /// keyring without waiting for each item's next edit.
+    #[serde(default)]
+    pub fields: u32,
     /// Per entry id: the last-synced snapshot the merge runs against.
     pub entries: HashMap<String, EntryState>,
 }
@@ -117,6 +140,8 @@ pub(crate) struct KrEntry {
     pub notes: String,
     /// The vault name (`op-vault`).
     pub group: String,
+    /// Custom text fields, label → value (`field:<label>` attributes).
+    pub fields: BTreeMap<String, String>,
     pub modified: u64,
 }
 
@@ -125,6 +150,15 @@ impl KrEntry {
         let mut h = blake3::Hasher::new_keyed(key);
         for part in [&self.title, &self.username, &self.password, &self.url, &self.notes, &self.group] {
             h.update(part.as_bytes());
+            h.update(&[0]);
+        }
+        // Only when there are any, so an entry without custom fields hashes
+        // as it did before they were synced and no base goes stale.
+        for (label, value) in &self.fields {
+            h.update(&[1]);
+            h.update(label.as_bytes());
+            h.update(&[0]);
+            h.update(value.as_bytes());
             h.update(&[0]);
         }
         h.finalize().to_hex().to_string()
@@ -234,5 +268,59 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> KrEntry {
+        KrEntry {
+            title: "T".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "https://x.example".into(),
+            notes: "n".into(),
+            group: "Personal".into(),
+            fields: BTreeMap::new(),
+            modified: 0,
+        }
+    }
+
+    /// Bases written before custom fields were synced must still match an
+    /// entry without any, or every entry would read as changed on both sides.
+    #[test]
+    fn an_entry_without_custom_fields_hashes_as_before() {
+        let key = [7u8; 32];
+        let mut h = blake3::Hasher::new_keyed(&key);
+        for part in ["T", "u", "p", "https://x.example", "n", "Personal"] {
+            h.update(part.as_bytes());
+            h.update(&[0]);
+        }
+        assert_eq!(entry().hash(&key), h.finalize().to_hex().to_string());
+    }
+
+    #[test]
+    fn custom_fields_move_the_hash() {
+        let key = [7u8; 32];
+        let mut with = entry();
+        with.fields.insert("pin".into(), "1234".into());
+        assert_ne!(with.hash(&key), entry().hash(&key));
+        let mut other = entry();
+        other.fields.insert("pin".into(), "1235".into());
+        assert_ne!(with.hash(&key), other.hash(&key));
+    }
+
+    #[test]
+    fn custom_fields_come_from_prefixed_attributes() {
+        let attrs: HashMap<String, String> = [
+            ("field:PIN".to_string(), "1234".to_string()),
+            ("field:".to_string(), "no label".to_string()),
+            ("UserName".to_string(), "u".to_string()),
+        ]
+        .into();
+        let got = fields_from_attrs(&attrs);
+        assert_eq!(got, [("PIN".to_string(), "1234".to_string())].into());
     }
 }

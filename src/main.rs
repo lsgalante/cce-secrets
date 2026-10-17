@@ -2,7 +2,7 @@ use secret_service::{EncryptionType, SecretService};
 
 use cce_ui::widget::Handle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetEvent, WidgetHost, LINE_PX};
+use cce_ui::widget::{Bounds, Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion, ScrollbarActivity, TextBox, WidgetEvent, WidgetHost, WidgetId, LINE_PX};
 
 const LIST_W: f32 = 280.0;
 const ROW_H: f32 = 44.0;
@@ -13,6 +13,16 @@ const CLIPBOARD_CLEAR_SECS: u64 = 30;
 /// Entry fields written back as Secret Service attributes (cce-keyring-sync
 /// mirrors them to 1Password's username / url / notes; Title is the label).
 const EDIT_ATTRS: [&str; 3] = ["UserName", "URL", "Notes"];
+
+/// Attribute prefix of a custom field: `field:PIN` is the field named PIN.
+/// cce-keyring-sync mirrors these to 1Password custom text fields by label.
+const FIELD_PREFIX: &str = "field:";
+
+/// The notes box's height, in single-line box heights.
+const NOTES_ROWS: f32 = 4.0;
+
+/// Lines of a multi-line value the entry view shows before eliding.
+const VALUE_LINES_SHOWN: usize = 6;
 
 /// One Secret Service item, sans secret: the secret itself is fetched on
 /// demand by object path (reveal/copy) and never held in the list.
@@ -103,6 +113,61 @@ enum AppMessage {
     DeleteClicked,
     SaveClicked,
     CancelClicked,
+    AddFieldClicked,
+    RemoveFieldClicked(usize),
+}
+
+/// One custom field's row in the entry form.
+#[derive(Clone, Copy)]
+struct FieldRow {
+    name: Handle<cce_ui::widget::Adapted<TextBox>>,
+    value: Handle<cce_ui::widget::Adapted<TextBox>>,
+    remove: Handle<cce_ui::widget::Adapted<Button>>,
+}
+
+/// The custom fields a save leaves, as attribute edits in
+/// `merge_edited_attributes`' terms: each row's `field:<name>`, plus an
+/// empty value (a removal) for every field the form opened with that is no
+/// longer there — deleted, or renamed away. Rows with neither name nor
+/// value are skipped; a value without a name, or a name twice, is refused.
+fn custom_field_edits(rows: &[(String, String)], before: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut edits: Vec<(String, String)> = Vec::new();
+    for (name, value) in rows {
+        if name.is_empty() {
+            if value.is_empty() {
+                continue;
+            }
+            return Err("A custom field needs a name".to_string());
+        }
+        let key = format!("{FIELD_PREFIX}{name}");
+        if edits.iter().any(|(k, _)| *k == key) {
+            return Err(format!("Two custom fields are named \"{name}\""));
+        }
+        edits.push((key, value.clone()));
+    }
+    for key in before {
+        if !edits.iter().any(|(k, _)| k == key) {
+            edits.push((key.clone(), String::new()));
+        }
+    }
+    Ok(edits)
+}
+
+/// An attribute's name as the entry view shows it: a custom field by its own name.
+fn attr_display_name(key: &str) -> &str {
+    key.strip_prefix(FIELD_PREFIX).filter(|n| !n.is_empty()).unwrap_or(key)
+}
+
+/// A value's lines as the entry view shows them: at most
+/// `VALUE_LINES_SHOWN`, the last one marked when lines were left out.
+fn shown_lines(value: &str) -> Vec<String> {
+    let lines: Vec<&str> = value.lines().collect();
+    if lines.len() <= VALUE_LINES_SHOWN {
+        return if lines.is_empty() { vec![String::new()] } else { lines.into_iter().map(str::to_string).collect() };
+    }
+    let mut shown: Vec<String> = lines[..VALUE_LINES_SHOWN].iter().map(|l| l.to_string()).collect();
+    shown[VALUE_LINES_SHOWN - 1].push_str(" …");
+    shown
 }
 
 /// What the detail pane shows: the read-only entry view, or the entry form
@@ -721,6 +786,24 @@ struct SecretsApp {
     url_box: Handle<cce_ui::widget::Adapted<TextBox>>,
     notes_box: Handle<cce_ui::widget::Adapted<TextBox>>,
     pass_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    /// The custom fields under the password, one row each; created by
+    /// `open_form` / Add field and dropped from the context on close.
+    field_rows: Vec<FieldRow>,
+    add_field_btn: Handle<cce_ui::widget::Adapted<Button>>,
+    /// The `field:*` attributes the form opened with, so a save removes the
+    /// ones deleted or renamed.
+    fields_before: Vec<String>,
+    /// The form scrolls inside the detail pane once it outgrows it: the
+    /// drawn offset, its glide, and the viewport (x, y, w, h) and content
+    /// height of the last paint.
+    form_scroll: f32,
+    form_motion: ScrollMotion,
+    form_rect: (f32, f32, f32, f32),
+    form_content_h: f32,
+    /// The form widget last scrolled into view because it took the
+    /// keyboard: a newly focused one is brought into view once, and then
+    /// the wheel may move it away again.
+    form_focus_seen: Option<WidgetId>,
 
     mode: Mode,
     entries: Vec<EntryData>,
@@ -909,7 +992,8 @@ impl SecretsApp {
         changed
     }
 
-    fn form_boxes(&self) -> [Handle<cce_ui::widget::Adapted<TextBox>>; 5] {
+    /// The form's fixed boxes, top to bottom.
+    fn fixed_form_boxes(&self) -> [Handle<cce_ui::widget::Adapted<TextBox>>; 5] {
         [
             self.title_box,
             self.user_box,
@@ -917,6 +1001,81 @@ impl SecretsApp {
             self.notes_box,
             self.pass_box,
         ]
+    }
+
+    /// Every box in the form, the custom fields' included.
+    fn form_boxes(&self) -> Vec<Handle<cce_ui::widget::Adapted<TextBox>>> {
+        let mut v = self.fixed_form_boxes().to_vec();
+        for r in &self.field_rows {
+            v.push(r.name);
+            v.push(r.value);
+        }
+        v
+    }
+
+    /// The buttons that live in the form (and scroll with it).
+    fn form_buttons(&self) -> Vec<Handle<cce_ui::widget::Adapted<Button>>> {
+        let mut v = vec![self.add_field_btn, self.save_btn, self.cancel_btn];
+        v.extend(self.field_rows.iter().map(|r| r.remove));
+        v
+    }
+
+    /// Whether a pointer at (x, y) may reach the form's widgets: while
+    /// editing, inside the form's viewport. Scrolled out, a widget stays
+    /// placed so the Tab walk can reach it, but is clipped from view, and
+    /// a click on the header or the status line must not land on it.
+    fn in_form(&self, x: f32, y: f32) -> bool {
+        let (fx, fy, fw, fh) = self.form_rect;
+        self.editing() && x >= fx && x <= fx + fw && y >= fy && y <= fy + fh
+    }
+
+    fn is_form_widget(&self, id: WidgetId) -> bool {
+        self.form_boxes().iter().any(|b| b.id() == id) || self.form_buttons().iter().any(|b| b.id() == id)
+    }
+
+    /// The form widget holding the keyboard, if any. A text box reports it
+    /// by editing; a button through the context.
+    fn form_focus(&self) -> Option<WidgetId> {
+        self.form_boxes()
+            .into_iter()
+            .find(|b| self.ui_context[*b].editing)
+            .map(|b| b.id())
+            .or_else(|| self.form_buttons().into_iter().map(|b| b.id()).find(|id| self.ui_context.is_focused_id(*id)))
+    }
+
+    fn form_max_scroll(&self) -> f32 {
+        (self.form_content_h - self.form_rect.3).max(0.0)
+    }
+
+    fn add_field_row(&mut self, name: &str, value: &str) -> FieldRow {
+        let row = FieldRow {
+            name: self.ui_context.insert(TextBox::new(name.to_string()).with_placeholder("name")),
+            value: self.ui_context.insert(TextBox::new(value.to_string()).with_placeholder("value")),
+            remove: self
+                .ui_context
+                .insert(Button::new(-1000.0, -1000.0, BTN_W, cce_ui::layout::button_height()).with_label("Remove")),
+        };
+        self.field_rows.push(row);
+        row
+    }
+
+    fn drop_field_row(&mut self, i: usize) {
+        if i >= self.field_rows.len() {
+            return;
+        }
+        let row = self.field_rows.remove(i);
+        for id in [row.name.id(), row.value.id(), row.remove.id()] {
+            self.ui_context.unfocus_id(id);
+        }
+        self.ui_context.remove(row.name);
+        self.ui_context.remove(row.value);
+        self.ui_context.remove(row.remove);
+    }
+
+    fn clear_field_rows(&mut self) {
+        while !self.field_rows.is_empty() {
+            self.drop_field_row(self.field_rows.len() - 1);
+        }
     }
 
     /// Open the form prefilled from `entry` (or blank for a new one).
@@ -933,6 +1092,17 @@ impl SecretsApp {
         self.ui_context[self.pass_box].placeholder = Some(
             if entry.is_some() { "leave blank to keep current" } else { "password" }.to_string(),
         );
+        self.clear_field_rows();
+        self.fields_before.clear();
+        for (key, value) in entry.map(|e| e.attrs.clone()).unwrap_or_default() {
+            if let Some(name) = key.strip_prefix(FIELD_PREFIX).filter(|n| !n.is_empty()) {
+                self.add_field_row(name, &value);
+                self.fields_before.push(key);
+            }
+        }
+        self.form_scroll = 0.0;
+        self.form_motion = ScrollMotion::new();
+        self.form_focus_seen = None;
         self.mode = Mode::Edit { path: entry.map(|e| e.path.clone()) };
         self.pending_delete = None;
         self.revealed = None;
@@ -948,6 +1118,8 @@ impl SecretsApp {
         for b in self.form_boxes() {
             self.ui_context.unfocus_id(b.id());
         }
+        self.clear_field_rows();
+        self.fields_before.clear();
         self.mode = Mode::Browse;
     }
 
@@ -963,11 +1135,24 @@ impl SecretsApp {
             .map(|b| live_text(b).trim().to_string());
         // Every edited field, empty ones included: an update removes what was
         // cleared (`merge_edited_attributes`); a new item just skips them.
-        let attrs: Vec<(String, String)> = EDIT_ATTRS
+        let mut attrs: Vec<(String, String)> = EDIT_ATTRS
             .iter()
             .zip(values)
             .map(|(k, v)| (k.to_string(), v))
             .collect();
+        let rows: Vec<(String, String)> = self
+            .field_rows
+            .iter()
+            .map(|r| (live_text(&self.ui_context[r.name]).trim().to_string(), live_text(&self.ui_context[r.value]).trim().to_string()))
+            .collect();
+        match custom_field_edits(&rows, &self.fields_before) {
+            Ok(edits) => attrs.extend(edits),
+            Err(e) => {
+                self.status_msg = e;
+                self.status_is_error = true;
+                return None;
+            }
+        }
         let password = live_text(&self.ui_context[self.pass_box]).to_string();
         let Mode::Edit { path } = &self.mode else { return None };
         Some(match path {
@@ -1011,8 +1196,8 @@ impl SecretsApp {
             .unwrap_or_default();
     }
 
-    fn buttons(&self) -> [Handle<cce_ui::widget::Adapted<Button>>; 10] {
-        [
+    fn buttons(&self) -> Vec<Handle<cce_ui::widget::Adapted<Button>>> {
+        let mut v = vec![
             self.refresh_btn,
             self.sync_btn,
             self.new_btn,
@@ -1021,9 +1206,9 @@ impl SecretsApp {
             self.otp_btn,
             self.edit_btn,
             self.delete_btn,
-            self.save_btn,
-            self.cancel_btn,
-        ]
+        ];
+        v.extend(self.form_buttons());
+        v
     }
 
     /// Whether one of the buttons has the keyboard (the Tab walk put it there):
@@ -1060,6 +1245,10 @@ impl SecretsApp {
                 AppMessage::SaveClicked
             } else if id == self.cancel_btn.id() {
                 AppMessage::CancelClicked
+            } else if id == self.add_field_btn.id() {
+                AppMessage::AddFieldClicked
+            } else if let Some(i) = self.field_rows.iter().position(|r| r.remove.id() == id) {
+                AppMessage::RemoveFieldClicked(i)
             } else {
                 continue;
             };
@@ -1072,6 +1261,7 @@ impl SecretsApp {
         first
     }
 
+    /// The widgets outside the form.
     fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
             &self.ui_context[self.search_box],
@@ -1083,14 +1273,19 @@ impl SecretsApp {
             &self.ui_context[self.otp_btn],
             &self.ui_context[self.edit_btn],
             &self.ui_context[self.delete_btn],
-            &self.ui_context[self.save_btn],
-            &self.ui_context[self.cancel_btn],
-            &self.ui_context[self.title_box],
-            &self.ui_context[self.user_box],
-            &self.ui_context[self.url_box],
-            &self.ui_context[self.notes_box],
-            &self.ui_context[self.pass_box],
         ]
+    }
+
+    /// The form's widgets, painted clipped to its viewport.
+    fn form_widgets_iter(&self) -> Vec<&dyn WidgetHost> {
+        let mut v: Vec<&dyn WidgetHost> = Vec::new();
+        for b in self.form_boxes() {
+            v.push(&self.ui_context[b]);
+        }
+        for b in self.form_buttons() {
+            v.push(&self.ui_context[b]);
+        }
+        v
     }
 }
 
@@ -1142,8 +1337,16 @@ impl Application for SecretsApp {
             title_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("title")),
             user_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("username")),
             url_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("url")),
-            notes_box: ui_context.insert(TextBox::new(String::new()).with_placeholder("notes")),
+            notes_box: ui_context.insert(TextBox::new(String::new()).with_multiline(true).with_placeholder("notes")),
             pass_box: ui_context.insert(TextBox::new(String::new()).with_password(true).with_placeholder("password")),
+            field_rows: Vec::new(),
+            add_field_btn: ui_context.insert(Button::new(0.0, 0.0, BTN_W, cce_ui::layout::button_height()).with_label("Add field")),
+            fields_before: Vec::new(),
+            form_scroll: 0.0,
+            form_motion: ScrollMotion::new(),
+            form_rect: (0.0, 0.0, 0.0, 0.0),
+            form_content_h: 0.0,
+            form_focus_seen: None,
             mode: Mode::Browse,
             entries: Vec::new(),
             selected: None,
@@ -1318,11 +1521,27 @@ impl Application for SecretsApp {
                 }
             }
             AppMessage::CancelClicked => self.close_form(),
+            AppMessage::AddFieldClicked => {
+                if self.editing() {
+                    let row = self.add_field_row("", "");
+                    for b in self.form_boxes() {
+                        self.ui_context.unfocus_id(b.id());
+                    }
+                    self.ui_context.focus_id(row.name.id());
+                }
+            }
+            AppMessage::RemoveFieldClicked(i) => self.drop_field_row(i),
         }
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         if self.tick_scroll(dt) {
+            *needs_rebuild = true;
+        }
+        self.form_motion.reconcile(0.0, self.form_scroll);
+        if self.form_motion.is_animating() {
+            self.form_motion.tick(dt, Bounds::max(0.0), Bounds::max(self.form_max_scroll()));
+            self.form_scroll = self.form_motion.y.pos();
             *needs_rebuild = true;
         }
         let overflowing = self.filtered().len() as f32 * ROW_H > self.list_rect.3;
@@ -1444,25 +1663,96 @@ impl Application for SecretsApp {
                 let header = if path.is_some() { "Edit entry" } else { "New entry" };
                 pc.text_with(header.to_string(), dx, hy, 15.0, srgb_u8(cce_ui::color::TEXT_HEADER), None, detail_bounds);
                 let labels = ["Title", "UserName", "URL", "Notes", "Password"];
-                let mut fy = hy + 22.0 + pgap;
                 let box_w = (dw - 4.0).min(320.0); // TODO(style): 4px slack on the field width, not a rung
-                // Each field is a 10px label strip (14.0) over a textbox. The
-                // fields are `pgap` apart rather than `control_gap()`: five
-                // control-height gaps overrun the default window height.
-                for (label, tb) in labels.iter().zip(self.form_boxes()) {
-                    self.ui_context[tb].set_rect(dx, fy + 14.0, box_w, box_h);
-                    pc.text_with(label.to_string(), dx, fy, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, None);
-                    fy += 14.0 + box_h + pgap;
+                // A custom field's row: name, value, Remove — wider than one
+                // box, so the two boxes are not squeezed beside the button.
+                let row_w = (dw - 4.0).min(320.0 + BTN_W + pgap);
+                let name_w = ((row_w - BTN_W - 2.0 * pgap) * 0.4).max(0.0);
+                let value_w = (row_w - BTN_W - 2.0 * pgap - name_w).max(0.0);
+                let notes_h = box_h * NOTES_ROWS;
+                let row_h = box_h.max(btn_h);
+
+                // The form scrolls under the header, inside the pane. First
+                // every offset from the form's top, then the scroll, then the
+                // rects. Each field is a 10px label strip (14.0) over a
+                // textbox. The fields are `pgap` apart rather than
+                // `control_gap()`: five control-height gaps overrun the
+                // default window height.
+                let top = hy + 22.0 + pgap;
+                let view_h = (list_y + list_h - top).max(0.0);
+                self.form_rect = (dx, top, dw, view_h);
+                let mut y = 0.0;
+                let mut box_ys = [0.0f32; 5];
+                let mut spans: Vec<(WidgetId, f32, f32)> = Vec::new();
+                for (i, tb) in self.fixed_form_boxes().into_iter().enumerate() {
+                    let h = if i == 3 { notes_h } else { box_h };
+                    box_ys[i] = y;
+                    spans.push((tb.id(), y, y + 14.0 + h));
+                    y += 14.0 + h + pgap;
                 }
-                self.ui_context[self.save_btn].set_rect(dx, fy, BTN_W, btn_h);
-                self.ui_context[self.cancel_btn].set_rect(dx + BTN_W + pgap, fy, BTN_W, btn_h);
+                let fields_label_y = y;
+                y += 14.0;
+                let mut row_ys = Vec::with_capacity(self.field_rows.len());
+                for r in &self.field_rows {
+                    for id in [r.name.id(), r.value.id(), r.remove.id()] {
+                        spans.push((id, y, y + row_h));
+                    }
+                    row_ys.push(y);
+                    y += row_h + pgap;
+                }
+                let add_y = y;
+                spans.push((self.add_field_btn.id(), y, y + btn_h));
+                y += btn_h + pgap;
+                let save_y = y;
+                spans.push((self.save_btn.id(), y, y + btn_h));
+                spans.push((self.cancel_btn.id(), y, y + btn_h));
+                y += btn_h;
+                self.form_content_h = y;
+
+                // A widget that newly took the keyboard (Tab, Add field) is
+                // scrolled into view, once.
+                let focus = self.form_focus();
+                if focus != self.form_focus_seen {
+                    if let Some((_, t, b)) = focus.and_then(|f| spans.iter().find(|(id, _, _)| *id == f)) {
+                        if *t < self.form_scroll {
+                            self.form_scroll = *t;
+                        } else if *b > self.form_scroll + view_h {
+                            self.form_scroll = b - view_h;
+                        }
+                        self.form_motion.y.jump_to(self.form_scroll);
+                    }
+                    self.form_focus_seen = focus;
+                }
+                self.form_scroll = self.form_scroll.clamp(0.0, self.form_max_scroll());
+                let fy = top - self.form_scroll;
+
+                let clip = Rect { x: dx, y: top, width: dw, height: view_h };
+                pc.push_clip(clip);
+                for ((label, tb), (i, by)) in labels.iter().zip(self.fixed_form_boxes()).zip(box_ys.into_iter().enumerate()) {
+                    let h = if i == 3 { notes_h } else { box_h };
+                    self.ui_context[tb].set_rect(dx, fy + by + 14.0, box_w, h);
+                    pc.text_with(label.to_string(), dx, fy + by, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, None);
+                }
+                pc.text_with("Custom fields".to_string(), dx, fy + fields_label_y, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, None);
+                for (r, ry) in self.field_rows.clone().into_iter().zip(row_ys) {
+                    let ry = fy + ry;
+                    self.ui_context[r.name].set_rect(dx, ry, name_w, box_h);
+                    self.ui_context[r.value].set_rect(dx + name_w + pgap, ry, value_w, box_h);
+                    self.ui_context[r.remove].set_rect(dx + name_w + value_w + 2.0 * pgap, ry, BTN_W, btn_h);
+                }
+                pc.pop_clip();
+                self.ui_context[self.add_field_btn].set_rect(dx, fy + add_y, BTN_W, btn_h);
+                self.ui_context[self.save_btn].set_rect(dx, fy + save_y, BTN_W, btn_h);
+                self.ui_context[self.cancel_btn].set_rect(dx + BTN_W + pgap, fy + save_y, BTN_W, btn_h);
                 for b in [self.reveal_btn, self.copy_btn, self.otp_btn, self.edit_btn, self.delete_btn, self.new_btn] {
                     park(&mut self.ui_context[b]);
                 }
             }
             Mode::Browse => {
+                self.form_rect = (0.0, 0.0, 0.0, 0.0);
                 park(&mut self.ui_context[self.save_btn]);
                 park(&mut self.ui_context[self.cancel_btn]);
+                park(&mut self.ui_context[self.add_field_btn]);
                 for tb in self.form_boxes() {
                     self.ui_context[tb].set_rect(-1000.0, -1000.0, 10.0, 10.0);
                 }
@@ -1473,9 +1763,16 @@ impl Application for SecretsApp {
                     // The header block (a 15px line, a 10px line), a pane gap,
                     // then the attribute rows at their 22.0 line advance.
                     let mut ay = hy + 22.0 + 14.0 + pgap;
+                    // A multi-line value (notes) takes a 15.0 advance per
+                    // further line, up to VALUE_LINES_SHOWN.
                     for (key, value) in &entry.attrs {
-                        pc.text_with(key.clone(), dx, ay, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
-                        pc.text_with(value.clone(), dx + 120.0, ay, 11.0, srgb_u8(cce_ui::color::TEXT_FG), None, detail_bounds);
+                        pc.text_with(attr_display_name(key).to_string(), dx, ay, 10.0, srgb_u8(cce_ui::color::TEXT_DIM), None, detail_bounds);
+                        for (n, line) in shown_lines(value).into_iter().enumerate() {
+                            if n > 0 {
+                                ay += 15.0;
+                            }
+                            pc.text_with(line, dx + 120.0, ay, 11.0, srgb_u8(cce_ui::color::TEXT_FG), None, detail_bounds);
+                        }
                         ay += 22.0;
                     }
 
@@ -1535,6 +1832,14 @@ impl Application for SecretsApp {
         for w in self.widgets_iter() {
             cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
+        if self.editing() {
+            let (fx, fy, fw, fh) = self.form_rect;
+            pc.push_clip(Rect { x: fx, y: fy, width: fw, height: fh });
+            for w in self.form_widgets_iter() {
+                cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
+            }
+            pc.pop_clip();
+        }
 
         let status_color = if self.status_is_error { [0xee, 0x5c, 0x5c] } else { srgb_u8(cce_ui::color::TEXT_DIM) };
         pc.text_with(
@@ -1590,8 +1895,10 @@ impl Application for SecretsApp {
         }
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let mut roots = vec![self.search_box.id()];
-        roots.extend(self.buttons().map(|b| b.id()));
-        roots.extend(self.form_boxes().map(|b| b.id()));
+        roots.extend(self.buttons().iter().map(|b| b.id()));
+        roots.extend(self.form_boxes().iter().map(|b| b.id()));
+        let in_form = self.in_form(pos.x, pos.y);
+        roots.retain(|&id| in_form || !self.is_form_widget(id));
         for root in roots {
             if self.ui_context.propagate_event(&mv, root) {
                 *needs_rebuild = true;
@@ -1634,10 +1941,13 @@ impl Application for SecretsApp {
         }
 
         // Buttons: propagate, then drain clicks into messages.
-        let button_roots: Vec<_> = {
-            let bs = self.buttons();
-            bs.iter().map(|b| b.id()).collect()
-        };
+        let in_form = self.in_form(lx, ly);
+        let button_roots: Vec<_> = self
+            .buttons()
+            .iter()
+            .map(|b| b.id())
+            .filter(|&id| in_form || !self.is_form_widget(id))
+            .collect();
         for root in button_roots {
             if self.ui_context.propagate_event(&ev, root) {
                 *needs_rebuild = true;
@@ -1649,17 +1959,18 @@ impl Application for SecretsApp {
 
         // Text boxes: unfocus the ones the press missed, then propagate.
         let mut box_roots = vec![self.search_box.id()];
-        if self.editing() {
-            box_roots.extend(self.form_boxes().map(|b| b.id()));
+        if in_form {
+            box_roots.extend(self.form_boxes().iter().map(|b| b.id()));
         }
         if state == ElementState::Pressed {
-            let mut missed = vec![self.search_box];
-            if self.editing() {
-                missed.extend(self.form_boxes());
+            if !self.ui_context[self.search_box].hit_test(lx, ly, &self.ui_context) {
+                self.ui_context.unfocus_id(self.search_box.id());
             }
-            for b in missed {
-                if !self.ui_context[b].hit_test(lx, ly, &self.ui_context) {
-                    self.ui_context.unfocus_id(b.id());
+            if self.editing() {
+                for b in self.form_boxes() {
+                    if !in_form || !self.ui_context[b].hit_test(lx, ly, &self.ui_context) {
+                        self.ui_context.unfocus_id(b.id());
+                    }
                 }
             }
         }
@@ -1702,6 +2013,24 @@ impl Application for SecretsApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if self.in_form(pos.x, pos.y) {
+            // The notes box scrolls its own text first; the form takes
+            // what it does not (nothing to scroll, or past its end).
+            if self.ui_context[self.notes_box].hit_test(pos.x, pos.y, &self.ui_context) {
+                let ev = cce_ui::widget::Event::MouseWheel { delta: *delta, x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
+                if self.ui_context.propagate_event(&ev, self.notes_box.id()) {
+                    *needs_rebuild = true;
+                    return;
+                }
+            }
+            self.form_motion.reconcile(0.0, self.form_scroll);
+            let moved = self.form_motion.apply(delta, (LINE_PX, LINE_PX), Bounds::max(0.0), Bounds::max(self.form_max_scroll()));
+            self.form_scroll = self.form_motion.y.pos();
+            if moved {
+                *needs_rebuild = true;
+            }
+            return;
+        }
         let (lx, ly, lw, lh) = self.list_rect;
         if pos.x < lx || pos.x > lx + lw || pos.y < ly || pos.y > ly + lh {
             return;
@@ -1738,7 +2067,10 @@ impl Application for SecretsApp {
                 }
                 // Tab never arrives here: the runner walks the focus
                 // (`ui_context_mut`), through the form's boxes, Save and Cancel.
-                Key::Named(NamedKey::Enter) if self.editing() && !self.button_focused() => {
+                // In the notes box Enter is a new line, not Save.
+                Key::Named(NamedKey::Enter)
+                    if self.editing() && !self.button_focused() && !self.ui_context[self.notes_box].editing =>
+                {
                     return Some(AppMessage::SaveClicked);
                 }
                 _ => {}
@@ -1747,7 +2079,7 @@ impl Application for SecretsApp {
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
         let mut roots = vec![self.search_box.id()];
         if self.editing() {
-            roots.extend(self.form_boxes().map(|b| b.id()));
+            roots.extend(self.form_boxes().iter().map(|b| b.id()));
         }
         if propagate_key(&mut self.ui_context, &kev, &roots) {
             *needs_rebuild = true;
@@ -1778,6 +2110,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// A save writes each custom field as `field:<name>` and removes the
+    /// ones the form opened with that are gone — deleted or renamed.
+    #[test]
+    fn custom_fields_save_as_prefixed_edits() {
+        let before = vec!["field:PIN".to_string(), "field:Old".to_string()];
+        let got = custom_field_edits(&pairs(&[("PIN", "9999"), ("New", "x"), ("", "")]), &before).unwrap();
+        assert_eq!(got, pairs(&[("field:PIN", "9999"), ("field:New", "x"), ("field:Old", "")]));
+        // Through the merge: Old removed, others kept or set.
+        let current: std::collections::HashMap<String, String> =
+            pairs(&[("field:PIN", "1234"), ("field:Old", "y"), ("op-item", "abc")]).into_iter().collect();
+        let merged = merge_edited_attributes(current, &got);
+        assert_eq!(merged.get("field:PIN").map(String::as_str), Some("9999"));
+        assert_eq!(merged.get("field:New").map(String::as_str), Some("x"));
+        assert!(!merged.contains_key("field:Old"));
+        assert_eq!(merged.get("op-item").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn a_nameless_or_doubled_custom_field_is_refused() {
+        assert!(custom_field_edits(&pairs(&[("", "value")]), &[]).is_err());
+        assert!(custom_field_edits(&pairs(&[("PIN", "1"), ("PIN", "2")]), &[]).is_err());
+    }
+
+    #[test]
+    fn long_values_are_elided_in_the_entry_view() {
+        assert_eq!(shown_lines("one"), vec!["one"]);
+        assert_eq!(shown_lines(""), vec![""]);
+        assert_eq!(shown_lines("a\nb"), vec!["a", "b"]);
+        let long = (1..=9).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let shown = shown_lines(&long);
+        assert_eq!(shown.len(), VALUE_LINES_SHOWN);
+        assert_eq!(shown.last().unwrap(), "6 …");
+        assert_eq!(attr_display_name("field:PIN"), "PIN");
+        assert_eq!(attr_display_name("UserName"), "UserName");
+    }
 
     /// One letter typed into the form is one letter, whichever box the
     /// context has focused and however many roots the key is offered to.

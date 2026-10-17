@@ -23,7 +23,10 @@ use secret_service::{EncryptionType, SecretService};
 
 use crate::adopt::{OP_ITEM_ATTR, OP_VAULT_ATTR};
 use crate::op::{Interchange, RemoteEntry};
-use crate::{journal_append, keyring_get, now_unix, take_lock, write_state, EntryState, KrEntry, State, APP};
+use crate::{
+    fields_from_attrs, journal_append, keyring_get, now_unix, take_lock, write_state, EntryState, KrEntry, State, APP,
+    FIELDS_VERSION, FIELD_PREFIX,
+};
 
 /// Allowed clock skew before "newer" means anything (the keyring's
 /// `Modified` is local time; the remote's is the server's).
@@ -114,6 +117,7 @@ fn remote_to_kr(e: &RemoteEntry, modified: u64) -> KrEntry {
         url: e.url.clone(),
         notes: e.notes.clone(),
         group: e.vault.clone(),
+        fields: e.fields.clone(),
         modified,
     }
 }
@@ -127,20 +131,31 @@ fn kr_to_remote(k: &KrEntry, id: &str, vault: &str) -> RemoteEntry {
         password: k.password.clone(),
         url: k.url.clone(),
         notes: k.notes.clone(),
+        fields: k.fields.clone(),
         updated: 0,
         updated_raw: String::new(),
     }
 }
 
-fn keyring_attrs<'a>(k: &'a KrEntry, id: &'a str, extra: &'a HashMap<String, String>) -> HashMap<&'a str, &'a str> {
-    // Keep whatever else the item carried (kdbx-uuid, xdg:schema, …).
-    let mut a: HashMap<&str, &str> = extra.iter().map(|(x, y)| (x.as_str(), y.as_str())).collect();
-    a.insert(OP_ITEM_ATTR, id);
-    a.insert(OP_VAULT_ATTR, k.group.as_str());
-    a.insert("UserName", k.username.as_str());
-    a.insert("URL", k.url.as_str());
-    a.insert("Notes", k.notes.as_str());
+fn keyring_attrs(k: &KrEntry, id: &str, extra: &HashMap<String, String>) -> HashMap<String, String> {
+    // Keep whatever else the item carried (kdbx-uuid, xdg:schema, …) but
+    // its custom fields, which are replaced as a set.
+    let mut a: HashMap<String, String> =
+        extra.iter().filter(|(x, _)| !x.starts_with(FIELD_PREFIX)).map(|(x, y)| (x.clone(), y.clone())).collect();
+    a.insert(OP_ITEM_ATTR.to_string(), id.to_string());
+    a.insert(OP_VAULT_ATTR.to_string(), k.group.clone());
+    a.insert("UserName".to_string(), k.username.clone());
+    a.insert("URL".to_string(), k.url.clone());
+    a.insert("Notes".to_string(), k.notes.clone());
+    for (label, value) in &k.fields {
+        a.insert(format!("{FIELD_PREFIX}{label}"), value.clone());
+    }
     a
+}
+
+/// `keyring_attrs`' map in the borrowed shape the Secret Service takes.
+fn borrowed(a: &HashMap<String, String>) -> HashMap<&str, &str> {
+    a.iter().map(|(x, y)| (x.as_str(), y.as_str())).collect()
 }
 
 struct Local<'a> {
@@ -183,6 +198,7 @@ async fn read_entry(
         url: attrs.get("URL").cloned().unwrap_or_default(),
         notes: attrs.get("Notes").cloned().unwrap_or_default(),
         group: attrs.get(OP_VAULT_ATTR).cloned().unwrap_or_else(|| vault.to_string()),
+        fields: fields_from_attrs(attrs),
         modified,
     })
 }
@@ -230,6 +246,17 @@ pub async fn sync_remote<I: Interchange>(
         return Err("the sync base is not 1Password's — run `cce-keyring-sync adopt` first".into());
     }
     let vault = state.vault.clone();
+    if state.fields < FIELDS_VERSION {
+        // The base predates custom fields. Unknown timestamps make this pass
+        // fetch every item once; one carrying custom fields then hashes off
+        // its base and its fields are copied to the keyring. Persisted with
+        // the pass, so an interrupted one carries on where it stopped.
+        println!("custom fields are new to the base: fetching every item once");
+        for e in state.entries.values_mut() {
+            e.op_updated_at.clear();
+        }
+        state.fields = FIELDS_VERSION;
+    }
 
     let ss = SecretService::connect(EncryptionType::Dh)
         .await
@@ -473,7 +500,7 @@ pub async fn sync_remote<I: Interchange>(
                         let attrs = keyring_attrs(&k, id, &l.attrs);
                         let r = async {
                             l.item.set_label(&k.title).await?;
-                            l.item.set_attributes(attrs).await?;
+                            l.item.set_attributes(borrowed(&attrs)).await?;
                             l.item.set_secret(k.password.as_bytes(), "text/plain").await?;
                             l.item.get_modified().await
                         }
@@ -488,7 +515,7 @@ pub async fn sync_remote<I: Interchange>(
                     }
                     None => {
                         let attrs = keyring_attrs(&k, id, &empty);
-                        match col.create_item(&k.title, attrs, k.password.as_bytes(), true, "text/plain").await {
+                        match col.create_item(&k.title, borrowed(&attrs), k.password.as_bytes(), true, "text/plain").await {
                             Ok(item) => item.get_modified().await.unwrap_or(now_unix() as u64),
                             Err(err) => {
                                 eprintln!("  keyring create failed for {}: {err}", k.title);
@@ -527,7 +554,7 @@ pub async fn sync_remote<I: Interchange>(
                         k.group = vault.clone();
                         let attrs = keyring_attrs(&k, &new_id, &l.attrs);
                         let modified = match async {
-                            l.item.set_attributes(attrs).await?;
+                            l.item.set_attributes(borrowed(&attrs)).await?;
                             l.item.get_modified().await
                         }
                         .await
@@ -579,7 +606,7 @@ pub async fn sync_remote<I: Interchange>(
                 Ok((new_id, updated_raw)) => {
                     let attrs = keyring_attrs(&k, &new_id, &l.attrs);
                     let modified = match async {
-                        l.item.set_attributes(attrs).await?;
+                        l.item.set_attributes(borrowed(&attrs)).await?;
                         l.item.get_modified().await
                     }
                     .await
